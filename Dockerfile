@@ -11,13 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ffmpeg \
     ca-certificates \
-    xz-utils \
     build-essential \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Install standalone lightweight Node.js (v20) directly to /usr/local
-RUN curl -fsSL https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz | tar -xJf - -C /usr/local --strip-components=1 --no-same-owner
+# 3. Install official Node.js (v20) via NodeSource cleanly
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 # 4. Install CUDA-enabled PyTorch & prune unused distributed libraries (~2.5 GB saved)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
@@ -60,11 +61,8 @@ RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
 
 # 9. Setup Application & Production NPM dependencies
 WORKDIR /app
-COPY package*.json ./
-RUN npm install --omit=dev --no-audit --no-fund
-
-# Copy entrypoint and application files
 COPY . .
+RUN npm install --omit=dev --no-audit --no-fund
 
 # Fix Windows line breaks and set permissions
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
