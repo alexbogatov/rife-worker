@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 2. Install essential system dependencies
+# 2. Install essential system dependencies (added procps for pkill)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
@@ -13,22 +13,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential \
     python3-dev \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Install official Node.js (v20) via NodeSource cleanly
+# 3. Install official Node.js (v20) via NodeSource
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. Install CUDA-enabled PyTorch & prune unused distributed libraries (~2.5 GB saved)
+# 4. Install CUDA-enabled PyTorch (safe library pruning)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir \
     torch torchvision --index-url https://download.pytorch.org/whl/cu121 \
     && find /usr/local/lib/python3.10/site-packages/torch/lib/ \
        -name "libnccl*" -o \
-       -name "libcufft*" -o \
-       -name "libcurand*" -o \
-       -name "libcusparse*" \
+       -name "libcufft*" \
        -delete
 
 # 5. Clone ComfyUI Core and install dependencies
@@ -62,16 +61,13 @@ RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
 # 9. Setup Application & Install Dependencies
 WORKDIR /app
 
-# Install standard production dependencies explicitly to bypass lockfile/cache errors
 RUN npm init -y && npm install --no-audit --no-fund \
     dotenv \
     ws \
     @aws-sdk/client-s3
 
-# Copy application files
 COPY . .
 
-# Fix Windows line breaks and set permissions
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
-ENTRYPOINT ["/app/entrypoint.sh"] 
+ENTRYPOINT ["/app/entrypoint.sh"]
