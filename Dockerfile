@@ -59,10 +59,17 @@ RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
     && ln -s /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
        /ComfyUI/models/vfi/rife/rife_v4.26.safetensors
 
-# 9. Setup Application & Production NPM dependencies
+# 9. Setup Application & Install Dependencies
 WORKDIR /app
+
+# Install standard production dependencies explicitly to bypass lockfile/cache errors
+RUN npm init -y && npm install --no-audit --no-fund \
+    dotenv \
+    ws \
+    @aws-sdk/client-s3
+
+# Copy application files
 COPY . .
-RUN npm install --omit=dev --no-audit --no-fund
 
 # Fix Windows line breaks and set permissions
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
