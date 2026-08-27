@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 2. Install essential system dependencies (added procps for pkill)
+# 2. Install essential system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
@@ -21,7 +21,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. Install CUDA-enabled PyTorch (safe library pruning)
+# 4. Install CUDA-enabled PyTorch
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir \
     torch torchvision --index-url https://download.pytorch.org/whl/cu121 \
@@ -30,9 +30,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
        -name "libcufft*" \
        -delete
 
-# 5. Clone ComfyUI Core and install dependencies
+# 5. Clone ComfyUI Core and install dependencies (strip buggy comfy_kitchen)
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /ComfyUI \
-    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/requirements.txt
+    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/requirements.txt \
+    && pip uninstall -y comfy_kitchen || true
 
 # 6. Pre-install all Video & Interpolation Python dependencies explicitly
 RUN pip install --no-cache-dir --prefer-binary \
