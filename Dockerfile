@@ -6,20 +6,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# 2. Install essential system dependencies (includes xz-utils for Node.js extraction)
+# 2. Install essential system binaries and build headers
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     ffmpeg \
     ca-certificates \
     xz-utils \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Install standalone lightweight Node.js (v20) directly to /usr/local
 RUN curl -fsSL https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz | tar -xJf - -C /usr/local --strip-components=1 --no-same-owner
 
 # 4. Install CUDA-enabled PyTorch & prune unused distributed libraries (~2.5 GB saved)
-RUN pip install --no-cache-dir --upgrade pip \
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir \
     torch torchvision --index-url https://download.pytorch.org/whl/cu121 \
     && find /usr/local/lib/python3.10/site-packages/torch/lib/ \
@@ -29,16 +31,18 @@ RUN pip install --no-cache-dir --upgrade pip \
        -name "libcusparse*" \
        -delete
 
-# 5. Clone ComfyUI Core & only the required custom nodes for RIFE
+# 5. Clone ComfyUI Core and install dependencies
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /ComfyUI \
-    && pip install --no-cache-dir -r /ComfyUI/requirements.txt \
-    && git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
-    && pip install --no-cache-dir -r /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/requirements.txt \
+    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/requirements.txt
+
+# 6. Install Custom Nodes
+RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
+    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/requirements.txt \
     && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite \
-    && pip install --no-cache-dir -r /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt \
+    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt \
     && find /root/.cache /tmp -mindepth 1 -delete
 
-# 6. Bake RIFE v4.26 Model Weights (~22MB)
+# 7. Bake RIFE v4.26 Model Weights (~22MB)
 RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
     && mkdir -p /ComfyUI/models/vfi/rife \
     && curl -L -f -o /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
@@ -46,7 +50,7 @@ RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
     && ln -s /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
        /ComfyUI/models/vfi/rife/rife_v4.26.safetensors
 
-# 7. Setup Application & Production NPM dependencies
+# 8. Setup Application & Production NPM dependencies
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev && npm cache clean --force
