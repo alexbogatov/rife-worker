@@ -45,8 +45,8 @@ RUN pip install --no-cache-dir --prefer-binary \
     kornia \
     av
 
-# 7. Clone Custom Nodes (without shallow submodule breaks)
-RUN git clone --recursive https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
+# 7. Clone Custom Nodes
+RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
     && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite \
     && find /root/.cache /tmp -mindepth 1 -delete
 
