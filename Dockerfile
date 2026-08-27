@@ -46,9 +46,9 @@ RUN pip install --no-cache-dir --prefer-binary \
     av
 
 # 7. Clone Custom Nodes
-RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
-    && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite \
-    && find /root/.cache /tmp -mindepth 1 -delete
+RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation
+RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
+RUN rm -rf /root/.cache /tmp/* /var/tmp/*
 
 # 8. Bake RIFE v4.26 Model Weights (~22MB)
 RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
