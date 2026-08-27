@@ -16,8 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Install standalone lightweight Node.js (v20) directly to /usr/local
-RUN curl -fsSL https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz | tar -xJf - -C /usr/local --strip-components=1 --no-same-owner \
-    && npm install -g npm@latest
+RUN curl -fsSL https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.xz | tar -xJf - -C /usr/local --strip-components=1 --no-same-owner
 
 # 4. Install CUDA-enabled PyTorch & prune unused distributed libraries (~2.5 GB saved)
 RUN pip install --no-cache-dir --upgrade pip \
