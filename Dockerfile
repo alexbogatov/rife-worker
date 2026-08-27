@@ -31,18 +31,27 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
        -name "libcusparse*" \
        -delete
 
-# 5. Clone ComfyUI Core and install dependencies
+# 5. Clone ComfyUI Core and install base dependencies
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /ComfyUI \
     && pip install --no-cache-dir --prefer-binary -r /ComfyUI/requirements.txt
 
-# 6. Install Custom Nodes
-RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
-    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/requirements.txt \
+# 6. Install Common Precompiled Wheels for VFI (headless OpenCV + CuPy 12.x binary)
+RUN pip install --no-cache-dir --prefer-binary \
+    opencv-python-headless \
+    cupy-cuda12x \
+    imageio-ffmpeg \
+    einops \
+    scipy \
+    timm
+
+# 7. Clone Custom Nodes with Submodules and install remaining dependencies
+RUN git clone --depth 1 --recursive https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation \
+    && pip install --no-cache-dir --prefer-binary --no-deps -r /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/requirements-no-cupy.txt || true \
     && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite \
     && pip install --no-cache-dir --prefer-binary -r /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt \
     && find /root/.cache /tmp -mindepth 1 -delete
 
-# 7. Bake RIFE v4.26 Model Weights (~22MB)
+# 8. Bake RIFE v4.26 Model Weights (~22MB)
 RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
     && mkdir -p /ComfyUI/models/vfi/rife \
     && curl -L -f -o /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
@@ -50,7 +59,7 @@ RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
     && ln -s /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
        /ComfyUI/models/vfi/rife/rife_v4.26.safetensors
 
-# 8. Setup Application & Production NPM dependencies
+# 9. Setup Application & Production NPM dependencies
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev && npm cache clean --force
