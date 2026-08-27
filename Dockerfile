@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir --prefer-binary \
     kornia \
     av
 
-# 7. Clone Custom Nodes
+# 7. Clone Custom Nodes cleanly
 RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation
 RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
 RUN rm -rf /root/.cache /tmp/* /var/tmp/*
@@ -61,12 +61,12 @@ RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
 # 9. Setup Application & Production NPM dependencies
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm install --omit=dev --no-audit --no-fund
 
 # Copy entrypoint and application files
 COPY . .
 
-# Fix line breaks and set permissions
+# Fix Windows line breaks and set permissions
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]
