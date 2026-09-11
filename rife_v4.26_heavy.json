@@ -1,7 +1,8 @@
 {
   "4": {
     "inputs": {
-      "file": "b753280b6ecc88b62bfb092062810e0e03d9c8751dffc3377c6ac9d63c2a6f48.mp4"
+      "file": "cd5b8e99d008c6f92188458e2f3070827ff9c0d8782a8a435fd5932811b94afb.webm",
+      "video-preview": ""
     },
     "class_type": "LoadVideo",
     "_meta": {
@@ -11,8 +12,9 @@
   "7": {
     "inputs": {
       "filename_prefix": "video/ComfyUI",
-      "format": "auto",
-      "format.codec": "auto",
+      "format": "mp4",
+      "format.codec": "h264",
+      "format.codec.encoding": "auto",
       "codec": "auto",
       "video": [
         "16:5",
@@ -26,7 +28,7 @@
   },
   "16:1": {
     "inputs": {
-      "model_name": "rife_v4.26.safetensors"
+      "model_name": "rife_v4.26_heavy.safetensors"
     },
     "class_type": "FrameInterpolationModelLoader",
     "_meta": {

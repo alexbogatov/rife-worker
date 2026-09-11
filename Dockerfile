@@ -1,74 +1,93 @@
-# 1. Lean Debian Python base
-FROM python:3.10-slim-bullseye
+FROM nvidia/cuda:13.0.0-base-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    NODE_ENV=production \
+    GIT_TERMINAL_PROMPT=0 \
+    PATH="/opt/venv/bin:$PATH" \
+    TRITON_KNOBS_BUILD_IMPL=torch \
+    CC=/usr/bin/gcc \
+    CXX=/usr/bin/g++ \
+    TORCH_CUDA_ARCH_LIST="8.9;9.0" \
+    MAX_JOBS=4
 
-# 2. Install essential system dependencies
+WORKDIR /app
+
+# 1. System utilities, Python 3, Node.js 20, GL libraries, and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
-    ffmpeg \
+    wget \
+    aria2 \
     ca-certificates \
-    build-essential \
+    libx11-6 \
+    libgl1 \
+    python3 \
+    python3-pip \
+    python3-venv \
     python3-dev \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
-
-# 3. Install official Node.js (v20) via NodeSource
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    build-essential \
+    gcc \
+    g++ \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
-# 4. Install Blackwell-compatible PyTorch (CUDA 12.8 / sm_120 + legacy archs)
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir \
-    torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
-    && find /usr/local/lib/python3.10/site-packages/torch/lib/ \
-       -name "libnccl*" -o \
-       -name "libcufft*" \
-       -delete
+# 2. Python virtual environment, PyTorch cu124 for L40, SageAttention & optimized kernels
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/venv/bin/pip install --no-cache-dir \
+       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 \
+    && /opt/venv/bin/pip install --no-cache-dir \
+       comfy-kitchen alembic sqlalchemy sageattention triton
 
-# 5. Clone ComfyUI Core and install dependencies (strip buggy comfy_kitchen)
-RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /ComfyUI \
-    && pip install --no-cache-dir --prefer-binary -r /ComfyUI/requirements.txt \
-    && pip uninstall -y comfy_kitchen || true
+# 3. Clone ComfyUI Core and install requirements
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
+    && /opt/venv/bin/pip install --no-cache-dir -r /app/ComfyUI/requirements.txt \
+    && rm -rf /root/.cache /tmp/*
 
-# 6. Pre-install all Video & Interpolation Python dependencies explicitly
-RUN pip install --no-cache-dir --prefer-binary \
-    opencv-python-headless \
-    imageio-ffmpeg \
-    moviepy \
-    einops \
-    scipy \
-    timm \
-    kornia \
-    av
+# 4. Patch comfy_kitchen na.py and sol_attn.py directly inside the venv for Python 3.10 compatibility
+RUN /opt/venv/bin/python3 -c "exec('''\n\
+import importlib.util, os\n\
+spec = importlib.util.find_spec(\"comfy_kitchen\")\n\
+base_dir = spec.submodule_search_locations[0]\n\
+files_to_patch = [\n\
+    os.path.join(base_dir, \"backends\", \"eager\", \"na.py\"),\n\
+    os.path.join(base_dir, \"backends\", \"eager\", \"sol_attn.py\")\n\
+]\n\
+for path in files_to_patch:\n\
+    if os.path.exists(path):\n\
+        code = open(path).read()\n\
+        if \"from typing import\" in code:\n\
+            code = code.replace(\"from typing import\", \"from typing import Sequence, Optional, List,\")\n\
+        else:\n\
+            code = \"from typing import Sequence, Optional, List\" + chr(10) + code\n\
+        code = code.replace(\"list[int]\", \"Sequence[int]\").replace(\"list[bool]\", \"Sequence[bool]\").replace(\"float | None\", \"Optional[float]\")\n\
+        open(path, \"w\").write(code)\n\
+        print(f\"[Build] Patched {os.path.basename(path)} successfully\")\n\
+''')"
 
-# 7. Clone Custom Nodes cleanly
-RUN git clone --depth 1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation
-RUN git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite
-RUN rm -rf /root/.cache /tmp/* /var/tmp/*
 
-# 8. Bake RIFE v4.26 Model Weights (~22MB)
-RUN mkdir -p /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife \
-    && mkdir -p /ComfyUI/models/vfi/rife \
-    && curl -L -f -o /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
-       https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26.safetensors \
-    && ln -s /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/rife_v4.26.safetensors \
-       /ComfyUI/models/vfi/rife/rife_v4.26.safetensors
+# 5. Create base fallback directories
+RUN mkdir -p /app/ComfyUI/models/diffusion_models \
+             /app/ComfyUI/models/clip \
+             /app/ComfyUI/models/vae \
+             /app/ComfyUI/input \
+             /app/ComfyUI/output
 
-# 9. Setup Application & Install Dependencies
-WORKDIR /app
+# 6. Install Node dependencies
+COPY package*.json /app/
+RUN if [ -f /app/package.json ]; then \
+      npm install --omit=dev && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
+    else \
+      npm init -y && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
+    fi
 
-RUN npm init -y && npm install --no-audit --no-fund \
-    dotenv \
-    ws \
-    @aws-sdk/client-s3
+# 7. Copy project files and workflow
+COPY . /app/
+RUN chmod +x /app/entrypoint.sh
 
-COPY . .
-
-RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+EXPOSE 8188
 
 ENTRYPOINT ["/app/entrypoint.sh"]
