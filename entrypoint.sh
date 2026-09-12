@@ -12,15 +12,53 @@ mkdir -p "${LOG_DIR}"
 # Mirror entrypoint stdout/stderr to disk and terminal
 exec > >(tee -a "${LOG_DIR}/entrypoint.log") 2>&1
 
-TOTAL_INSTANCES="${INSTANCES:-12}"
-
-echo "===================================================="
-echo "[Startup] Initializing ${TOTAL_INSTANCES}x Parallel ComfyUI Workers"
-echo "===================================================="
-
 # ==============================================================================
 # 1. Platform & GPU Auto-Discovery
 # ==============================================================================
+
+discover_lium_pod_id() {
+    if [ -z "$LIUM_API_KEY" ]; then
+        return 1
+    fi
+
+    local lium_base="${LIUM_BASE_URL:-https://lium.io/api}"
+
+    python3 -c '
+import json, urllib.request, socket, sys
+
+api_key = sys.argv[1]
+base_url = sys.argv[2]
+host = socket.gethostname().strip().lower()
+
+req = urllib.request.Request(f"{base_url}/pods", headers={"X-API-Key": api_key, "Accept": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.loads(resp.read().decode())
+        pods = data if isinstance(data, list) else data.get("data", data.get("pods", []))
+        if not pods:
+            sys.exit(1)
+
+        match = None
+        for p in pods:
+            containers = p.get("executor", {}).get("specs", {}).get("docker", {}).get("containers", [])
+            if any(c.get("container_id", "").lower().startswith(host) for c in containers):
+                match = p
+                break
+
+        if not match and len(pods) == 1:
+            match = pods[0]
+
+        if match:
+            pod_id = match.get("id") or match.get("uuid") or match.get("pod_id")
+            if pod_id:
+                sys.stdout.write(str(pod_id))
+                sys.exit(0)
+except Exception:
+    pass
+
+sys.exit(1)
+' "$LIUM_API_KEY" "$lium_base"
+}
 
 is_hyperstack() {
     if curl -s --connect-timeout 1 http://169.254.169.254/openstack/latest/meta_data.json 2>/dev/null | grep -qi "nexgen\|hyperstack"; then
@@ -47,6 +85,10 @@ elif [ -n "$VAST_CONTAINERLABEL" ] || [ -n "$CONTAINER_ID" ] || [ -n "$VAST_TCP_
     export RUNNER_PLATFORM="vastai"
 elif [ -n "$RUNPOD_POD_ID" ]; then
     export RUNNER_PLATFORM="runpod"
+elif LIUM_DISCOVERED=$(discover_lium_pod_id); then
+    export LIUM_POD_ID="$LIUM_DISCOVERED"
+    export RUNNER_PLATFORM="lium"
+    echo "[Platform] Verified Lium Pod ID: ${LIUM_POD_ID}"
 elif is_hyperstack; then
     export RUNNER_PLATFORM="hyperstack"
 else
@@ -59,16 +101,27 @@ if command -v nvidia-smi &> /dev/null; then
     export RUNNER_GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -n 1 | xargs)
 else
     export RUNNER_GPU_NAME="None"
-    export RUNNER_GPU_COUNT="0"
+    export RUNNER_GPU_COUNT="1"
     export RUNNER_GPU_VRAM="0"
 fi
+
+NUM_GPUS="${RUNNER_GPU_COUNT:-1}"
+if [ "$NUM_GPUS" -lt 1 ]; then
+    NUM_GPUS=1
+fi
+
+# INSTANCES represents the number of workers per GPU (default 3)
+INSTANCES_PER_GPU="${INSTANCES:-3}"
+TOTAL_INSTANCES=$(( INSTANCES_PER_GPU * NUM_GPUS ))
 
 MACHINE_ID=$(hostname)
 API_BASE_URL="${API_BASE_URL:-https://api.runltx.com}"
 HYPERSTACK_VM_NAME="${VM_NAME:-${MACHINE_ID}}"
 
+echo "===================================================="
 echo "[Platform] Runtime  : $RUNNER_PLATFORM"
-echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($RUNNER_GPU_COUNT detected, $RUNNER_GPU_VRAM VRAM)"
+echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($NUM_GPUS detected, $RUNNER_GPU_VRAM VRAM)"
+echo "[Hardware] Scaling  : ${INSTANCES_PER_GPU} instance(s) per GPU -> Total: ${TOTAL_INSTANCES} worker(s)"
 echo "===================================================="
 
 # ==============================================================================
@@ -80,7 +133,7 @@ SESSION_PAYLOAD=$(cat <<EOF
   "machine_id": "${MACHINE_ID}",
   "provider": "${RUNNER_PLATFORM}",
   "gpu_name": "${RUNNER_GPU_NAME}",
-  "gpu_count": ${RUNNER_GPU_COUNT},
+  "gpu_count": ${NUM_GPUS},
   "gpu_vram": "${RUNNER_GPU_VRAM}"
 }
 EOF
@@ -170,30 +223,32 @@ FRAME_INTERP_DIR="${MODEL_DIR}/frame_interpolation"
 
 download_if_missing "${RIFE_DIR}" "rife_v4.26_heavy.safetensors" "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26_heavy.safetensors"
 
-# Symlink so nodes checking either directory succeed
 if [ -f "${RIFE_DIR}/rife_v4.26_heavy.safetensors" ] && [ ! -f "${FRAME_INTERP_DIR}/rife_v4.26_heavy.safetensors" ]; then
     ln -sf "${RIFE_DIR}/rife_v4.26_heavy.safetensors" "${FRAME_INTERP_DIR}/rife_v4.26_heavy.safetensors"
 fi
 
 # ==============================================================================
-# 5. Launch N ComfyUI & N Node Daemons in Parallel
+# 5. Launch N ComfyUI & N Node Daemons (Pinned across 1..N GPUs)
 # ==============================================================================
 pkill -f "main.py" || true
 rm -f /app/ComfyUI/user/comfyui.db.lock || true
 cd /app
 
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8,max_split_size_mb:128}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 BASE_PORT=8188
 COMFY_PIDS=()
 WORKER_PIDS=()
 
-echo "[Startup] Spawning ${TOTAL_INSTANCES} ComfyUI instances (ports ${BASE_PORT} to $((BASE_PORT + TOTAL_INSTANCES - 1)))..."
+echo "[Startup] Distributing ${TOTAL_INSTANCES} ComfyUI runtimes across ${NUM_GPUS} GPU(s)..."
 
 for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
-    /opt/venv/bin/python3 /app/ComfyUI/main.py \
-        --listen 0.0.0.0 --port "${PORT}" --gpu-only --fast --use-sage-attention --disable-auto-launch \
+    GPU_INDEX=$(( (i - 1) % NUM_GPUS ))
+
+    echo "[Startup] Spawning ComfyUI runtime ${i}/${TOTAL_INSTANCES} -> GPU ${GPU_INDEX} (Port ${PORT})..."
+    CUDA_VISIBLE_DEVICES="${GPU_INDEX}" /opt/venv/bin/python3 /app/ComfyUI/main.py \
+        --listen 0.0.0.0 --port "${PORT}" --fast --use-sage-attention --disable-auto-launch \
         > "${LOG_DIR}/comfy_${i}.log" 2>&1 &
     COMFY_PIDS+=($!)
 done
@@ -276,8 +331,17 @@ echo "[Billing] Session closed. Jobs: ${JOBS_PROCESSED}, Total Time: ${TOTAL_GEN
 # 7. Cloud Teardown & Auto-Shutdown
 # ==============================================================================
 
+# --- Lium Pod Self-Termination ---
+if [ "$RUNNER_PLATFORM" = "lium" ] && [ -n "$LIUM_POD_ID" ]; then
+    echo "[Teardown] Calling Lium DELETE /api/pods/${LIUM_POD_ID}..."
+    LIUM_BASE_URL="${LIUM_BASE_URL:-https://lium.io/api}"
+    DELETE_RES=$(curl -s -X DELETE "${LIUM_BASE_URL}/pods/${LIUM_POD_ID}" \
+        -H "X-API-Key: ${LIUM_API_KEY}" \
+        -H "Accept: application/json" || true)
+    echo "[Teardown] Lium Response: ${DELETE_RES}"
+
 # --- Hyperstack Hibernation ---
-if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
+elif [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
     echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${HYPERSTACK_VM_NAME}..."
     HYPERSTACK_API_URL="${HYPERSTACK_API_URL:-https://infrahub-api.nexgencloud.com/v1}"
     
