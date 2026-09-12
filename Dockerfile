@@ -68,7 +68,6 @@ for path in files_to_patch:\n\
         print(f\"[Build] Patched {os.path.basename(path)} successfully\")\n\
 ''')"
 
-
 # 5. Create base fallback directories
 RUN mkdir -p /app/ComfyUI/models/diffusion_models \
              /app/ComfyUI/models/clip \
@@ -76,12 +75,14 @@ RUN mkdir -p /app/ComfyUI/models/diffusion_models \
              /app/ComfyUI/input \
              /app/ComfyUI/output
 
-# 6. Install Node dependencies
+# 6. Install Node dependencies and enforce ES module parsing
 COPY package*.json /app/
 RUN if [ -f /app/package.json ]; then \
+      npm pkg set type="module" && \
       npm install --omit=dev && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
     else \
-      npm init -y && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
+      npm init -y && npm pkg set type="module" && \
+      npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
     fi
 
 # 7. Copy project files and workflow

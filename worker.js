@@ -4,7 +4,6 @@ import { mkdir, writeFile, unlink, rename } from 'fs/promises';
 import { join } from 'path';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
-// Suppress Node deprecation/SDK alerts
 process.removeAllListeners('warning');
 
 const WORKER_SUFFIX = process.env.WORKER_SUFFIX || 'worker_1';
@@ -80,7 +79,8 @@ const poll_for_job = async () => {
     });
     if (!res.ok) return null;
     return await res.json();
-  } catch (_) {
+  } catch (err) {
+    console.error(`\x1b[31m${TAG} API Poll Error: ${err.message}\x1b[0m`);
     return null;
   }
 };
@@ -101,7 +101,9 @@ const complete_job = async (job_id, output_url, generation_time_sec) => {
     jobs_processed += 1;
     total_generation_time_sec += generation_time_sec;
     await sync_stats_to_disk();
-  } catch (_) {}
+  } catch (err) {
+    console.error(`\x1b[31m${TAG} Complete API Error: ${err.message}\x1b[0m`);
+  }
 };
 
 const fail_job = async (job_id, error_message) => {
@@ -116,7 +118,9 @@ const fail_job = async (job_id, error_message) => {
         error_message: String(error_message)
       }),
     });
-  } catch (_) {}
+  } catch (err) {
+    console.error(`\x1b[31m${TAG} Fail API Error: ${err.message}\x1b[0m`);
+  }
 };
 
 const wait_for_comfy_ready = async () => {
@@ -142,7 +146,15 @@ const execute_workflow = async (workflow) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: workflow }),
   });
-  const { prompt_id } = await response.json();
+
+  const resJson = await response.json();
+
+  if (!response.ok || resJson.error || !resJson.prompt_id) {
+    const errorDetails = JSON.stringify(resJson.node_errors || resJson.error || resJson);
+    throw new Error(`ComfyUI Prompt Rejected: ${errorDetails}`);
+  }
+
+  const { prompt_id } = resJson;
   const start_time = Date.now();
 
   while (true) {
@@ -152,6 +164,10 @@ const execute_workflow = async (workflow) => {
       const history_data = await history_res.json();
       const job_history = history_data[prompt_id];
       if (job_history) {
+        if (job_history.status?.status_str === 'error') {
+          throw new Error(`ComfyUI Execution Error: ${JSON.stringify(job_history.status)}`);
+        }
+
         const duration = (Date.now() - start_time) / 1000;
         const outputs = job_history.outputs || {};
         for (const nodeId in outputs) {
@@ -162,7 +178,7 @@ const execute_workflow = async (workflow) => {
             return { output_path: join(OUTPUT_DIR, `${sub}${vid.filename}`), duration };
           }
         }
-        throw new Error('No video output found');
+        throw new Error('No video output found in completed workflow history');
       }
     }
   }
@@ -170,6 +186,7 @@ const execute_workflow = async (workflow) => {
 
 const download_video = async (url, filename) => {
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download input video: HTTP ${res.status}`);
   const buffer = await res.arrayBuffer();
   await mkdir(INPUT_DIR, { recursive: true });
   const target_path = join(INPUT_DIR, filename);
@@ -195,6 +212,7 @@ const upload_and_complete_async = async (job_id, isolated_path, input_paths, dur
     await complete_job(job_id, r2_url, duration);
     console.log(`\x1b[32m${TAG} ✔ Job [${job_id}] finished in ${duration.toFixed(1)}s\x1b[0m`);
   } catch (err) {
+    console.error(`\x1b[31m${TAG} ✖ Upload/Complete Failed [${job_id}]: ${err.message}\x1b[0m`);
     await fail_job(job_id, err.message);
   } finally {
     try { await unlink(isolated_path); } catch (_) {}
@@ -223,7 +241,8 @@ const prefetch_next_job = async () => {
     const result = await poll_for_job();
     if (!result?.success || !result?.data) return null;
     return await prepare_job(result.data);
-  } catch (_) {
+  } catch (err) {
+    console.error(`\x1b[31m${TAG} Prefetch Failed: ${err.message}\x1b[0m`);
     return null;
   }
 };
@@ -284,6 +303,7 @@ const worker_loop = async () => {
         upload_task.finally(() => active_uploads.delete(upload_task));
 
       } catch (render_err) {
+        console.error(`\x1b[31m${TAG} ✖ Job Execution Failed [${current_job.job_id}]: ${render_err.message}\x1b[0m`);
         for (const p of current_job.downloaded_paths) {
           try { await unlink(p); } catch (_) {}
         }
@@ -291,7 +311,8 @@ const worker_loop = async () => {
       }
 
       current_job = null;
-    } catch (_) {
+    } catch (loop_err) {
+      console.error(`\x1b[31m${TAG} Unexpected Loop Error: ${loop_err.message}\x1b[0m`);
       await sleep(POLL_INTERVAL_SECONDS * 1000);
     }
   }
