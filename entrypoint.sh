@@ -115,6 +115,8 @@ MODEL_DIR="${PERSISTENT_DIR}/ComfyUI/models"
 mkdir -p "${MODEL_DIR}/diffusion_models" \
          "${MODEL_DIR}/clip" \
          "${MODEL_DIR}/vae" \
+         "${MODEL_DIR}/rife" \
+         "${MODEL_DIR}/frame_interpolation" \
          "${PERSISTENT_DIR}/ComfyUI/input" \
          "${PERSISTENT_DIR}/ComfyUI/output"
 
@@ -163,7 +165,15 @@ download_if_missing() {
     fi
 }
 
-download_if_missing "${MODEL_DIR}" "rife_v4.26_heavy.safetensors" "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26_heavy.safetensors"
+RIFE_DIR="${MODEL_DIR}/rife"
+FRAME_INTERP_DIR="${MODEL_DIR}/frame_interpolation"
+
+download_if_missing "${RIFE_DIR}" "rife_v4.26_heavy.safetensors" "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26_heavy.safetensors"
+
+# Symlink so nodes checking either directory succeed
+if [ -f "${RIFE_DIR}/rife_v4.26_heavy.safetensors" ] && [ ! -f "${FRAME_INTERP_DIR}/rife_v4.26_heavy.safetensors" ]; then
+    ln -sf "${RIFE_DIR}/rife_v4.26_heavy.safetensors" "${FRAME_INTERP_DIR}/rife_v4.26_heavy.safetensors"
+fi
 
 # ==============================================================================
 # 5. Launch N ComfyUI & N Node Daemons in Parallel
@@ -263,7 +273,7 @@ curl -s -X POST "${API_BASE_URL}/v1/worker/off" \
 echo "[Billing] Session closed. Jobs: ${JOBS_PROCESSED}, Total Time: ${TOTAL_GEN_TIME}s."
 
 # ==============================================================================
-# 7. Cloud Teardown & Auto-Shutdown (Instance-level)
+# 7. Cloud Teardown & Auto-Shutdown
 # ==============================================================================
 
 # --- Hyperstack Hibernation ---
