@@ -171,7 +171,7 @@ const execute_workflow = async (workflow) => {
         const duration = (Date.now() - start_time) / 1000;
         const outputs = job_history.outputs || {};
 
-        // 1. Prefer Node 7 directly (the Save Video node)
+        // 1. Prioritize node 7 (explicit video output node)
         const saveNodeOutput = outputs['7'];
         const mediaList = saveNodeOutput?.gifs || saveNodeOutput?.videos || saveNodeOutput?.images;
 
@@ -181,12 +181,12 @@ const execute_workflow = async (workflow) => {
           return { output_path: join(OUTPUT_DIR, `${sub}${item.filename}`), duration };
         }
 
-        // 2. Fallback: find any output entry with type === 'output'
+        // 2. Scan remaining outputs matching media output format
         for (const nodeId of Object.keys(outputs)) {
           for (const key of ['gifs', 'videos', 'images']) {
             const list = outputs[nodeId][key];
             if (Array.isArray(list)) {
-              const outItem = list.find(v => v.type === 'output');
+              const outItem = list.find((v) => v.type === 'output');
               if (outItem) {
                 const sub = outItem.subfolder ? `${outItem.subfolder}/` : '';
                 return { output_path: join(OUTPUT_DIR, `${sub}${outItem.filename}`), duration };
@@ -203,11 +203,22 @@ const execute_workflow = async (workflow) => {
 
 const download_video = async (url, filename) => {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to download input video: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} downloading ${url}`);
+
   const buffer = await res.arrayBuffer();
+  if (buffer.byteLength < 1024) {
+    throw new Error(`Downloaded video is empty or corrupt (${buffer.byteLength} bytes)`);
+  }
+
   await mkdir(INPUT_DIR, { recursive: true });
+
+  const temp_path = join(INPUT_DIR, `temp_${Date.now()}_${filename}`);
   const target_path = join(INPUT_DIR, filename);
-  await writeFile(target_path, Buffer.from(buffer));
+
+  // Write to a temporary file first and rename atomically
+  await writeFile(temp_path, Buffer.from(buffer));
+  await rename(temp_path, target_path);
+
   return target_path;
 };
 
@@ -223,7 +234,7 @@ const upload_to_r2 = async (file_path, job_id) => {
   return `${process.env.R2_CDN_URL}/${key}`;
 };
 
-const upload_and_complete_async = async (job_id, isolated_path, input_paths, duration) => {
+const upload_and_complete_async = async (job_id, isolated_path, duration) => {
   try {
     const r2_url = await upload_to_r2(isolated_path, job_id);
     await complete_job(job_id, r2_url, duration);
@@ -233,9 +244,6 @@ const upload_and_complete_async = async (job_id, isolated_path, input_paths, dur
     await fail_job(job_id, err.message);
   } finally {
     try { await unlink(isolated_path); } catch (_) {}
-    for (const p of input_paths) {
-      try { await unlink(p); } catch (_) {}
-    }
   }
 };
 
@@ -299,21 +307,25 @@ const worker_loop = async () => {
       empty_poll_count = 0;
       console.log(`${TAG} Got job ${current_job.job_id}`);
 
-      // 1. Concurrently prefetch next video during GPU generation
+      // 1. Prefetch next input during active GPU inference
       prefetch_promise = prefetch_next_job();
 
       try {
         const { output_path: generated_file, duration } = await execute_workflow(current_job.workflow);
 
+        // 2. Clean up downloaded input immediately after ComfyUI completes execution
+        for (const p of current_job.downloaded_paths) {
+          try { await unlink(p); } catch (_) {}
+        }
+
         const ext = generated_file.endsWith('.webm') ? 'webm' : 'mp4';
         const isolated_path = join(OUTPUT_DIR, `uploading_${WORKER_SUFFIX}_${current_job.job_id}.${ext}`);
         await rename(generated_file, isolated_path);
 
-        // 2. Concurrently upload to R2 while loop picks up the next job immediately
+        // 3. Delegate R2 upload to the background queue without holding unlinked input references
         const upload_task = upload_and_complete_async(
           current_job.job_id,
           isolated_path,
-          current_job.downloaded_paths,
           duration
         );
         active_uploads.add(upload_task);
