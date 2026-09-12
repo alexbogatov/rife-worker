@@ -1,6 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
+START_BOOT_TIME=$(date +%s)
 export GIT_TERMINAL_PROMPT=0
 
 # ==============================================================================
@@ -9,8 +10,21 @@ export GIT_TERMINAL_PROMPT=0
 LOG_DIR="${LOG_DIR:-/var/log/runner}"
 mkdir -p "${LOG_DIR}"
 
-# Mirror entrypoint stdout/stderr to disk and terminal
+# Mirror all stdout/stderr directly to terminal (Docker stdout) and entrypoint.log
 exec > >(tee -a "${LOG_DIR}/entrypoint.log") 2>&1
+
+echo "===================================================="
+echo "[Startup] Bootstrapping Multi-GPU ComfyUI Pipeline"
+echo "===================================================="
+
+# Diagnostic check: verify worker.js is actually JavaScript
+echo "[Diagnostic] Checking /app/worker.js head:"
+head -n 3 /app/worker.js || true
+if head -n 3 /app/worker.js | grep -qi "pipefail\|bash\|bin"; then
+    echo "[CRITICAL ERROR] /app/worker.js contains shell script code! Aborting."
+    sleep 3600
+    exit 1
+fi
 
 # ==============================================================================
 # 1. Platform & GPU Auto-Discovery
@@ -110,7 +124,6 @@ if [ "$NUM_GPUS" -lt 1 ]; then
     NUM_GPUS=1
 fi
 
-# INSTANCES represents the number of workers per GPU (default 3)
 INSTANCES_PER_GPU="${INSTANCES:-3}"
 TOTAL_INSTANCES=$(( INSTANCES_PER_GPU * NUM_GPUS ))
 
@@ -121,7 +134,7 @@ HYPERSTACK_VM_NAME="${VM_NAME:-${MACHINE_ID}}"
 echo "===================================================="
 echo "[Platform] Runtime  : $RUNNER_PLATFORM"
 echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($NUM_GPUS detected, $RUNNER_GPU_VRAM VRAM)"
-echo "[Hardware] Scaling  : ${INSTANCES_PER_GPU} instance(s) per GPU -> Total: ${TOTAL_INSTANCES} worker(s)"
+echo "[Hardware] Scaling  : ${INSTANCES_PER_GPU} instance(s)/GPU -> ${TOTAL_INSTANCES} total worker(s)"
 echo "===================================================="
 
 # ==============================================================================
@@ -193,22 +206,15 @@ download_if_missing() {
     if [ -f "${target_dir}/${file_name}" ]; then
         echo "[Storage] Found '${file_name}' on persistent storage. Skipping download."
     else
-        echo "[Storage] Missing '${file_name}'. Downloading via aria2..."
-        
+        echo "[Storage] Missing '${file_name}'. Downloading..."
         local ARIA_AUTH=()
         if [ -n "$HF_TOKEN" ]; then
             ARIA_AUTH=(--header="Authorization: Bearer ${HF_TOKEN}")
         fi
 
-        if ! aria2c -x 8 -s 8 -k 1M \
-            --async-dns=false \
-            --max-tries=5 \
-            --retry-wait=2 \
-            "${ARIA_AUTH[@]}" \
-            -d "${target_dir}" -o "${file_name}" "${url}"; then
-            
+        if ! aria2c -x 8 -s 8 -k 1M --async-dns=false --max-tries=5 --retry-wait=2 \
+            "${ARIA_AUTH[@]}" -d "${target_dir}" -o "${file_name}" "${url}"; then
             echo "[Storage Warning] aria2c failed. Falling back to wget..."
-            
             if [ -n "$HF_TOKEN" ]; then
                 wget --quiet --show-progress -c --header="Authorization: Bearer ${HF_TOKEN}" -O "${target_dir}/${file_name}" "${url}"
             else
@@ -228,7 +234,7 @@ if [ -f "${RIFE_DIR}/rife_v4.26_heavy.safetensors" ] && [ ! -f "${FRAME_INTERP_D
 fi
 
 # ==============================================================================
-# 5. Launch N ComfyUI & N Node Daemons (Pinned across 1..N GPUs)
+# 5. Launch Parallel Workers
 # ==============================================================================
 pkill -f "main.py" || true
 rm -f /app/ComfyUI/user/comfyui.db.lock || true
@@ -246,10 +252,10 @@ for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
     GPU_INDEX=$(( (i - 1) % NUM_GPUS ))
 
-    echo "[Startup] Spawning ComfyUI runtime ${i}/${TOTAL_INSTANCES} -> GPU ${GPU_INDEX} (Port ${PORT})..."
+    echo "[Startup] Spawning ComfyUI ${i}/${TOTAL_INSTANCES} on GPU ${GPU_INDEX} (Port ${PORT})..."
     CUDA_VISIBLE_DEVICES="${GPU_INDEX}" /opt/venv/bin/python3 /app/ComfyUI/main.py \
         --listen 0.0.0.0 --port "${PORT}" --fast --use-sage-attention --disable-auto-launch \
-        > "${LOG_DIR}/comfy_${i}.log" 2>&1 &
+        > >(tee -a "${LOG_DIR}/comfy_${i}.log") 2>&1 &
     COMFY_PIDS+=($!)
 done
 
@@ -260,18 +266,16 @@ for i in $(seq 1 "$TOTAL_INSTANCES"); do
         sleep 1
     done
 done
-echo "[Startup] All ${TOTAL_INSTANCES} ComfyUI runtimes online."
+echo "[Startup] All ComfyUI endpoints are healthy."
 
 echo "[Startup] Launching ${TOTAL_INSTANCES} Node.js workers..."
 for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
-    COMFY_PORT="${PORT}" WORKER_SUFFIX="worker_${i}" node worker.js > "${LOG_DIR}/worker_${i}.log" 2>&1 &
+    COMFY_PORT="${PORT}" WORKER_SUFFIX="worker_${i}" node worker.js > >(tee -a "${LOG_DIR}/worker_${i}.log") 2>&1 &
     WORKER_PIDS+=($!)
 done
 
-echo "[Startup] All ${TOTAL_INSTANCES} workers running. Tail logs with:"
-echo "  tail -fn +1 ${LOG_DIR}/worker_*.log"
-echo "  tail -f ${LOG_DIR}/entrypoint.log"
+echo "[Startup] All workers operational. Streaming active logs..."
 
 # Await workers completion
 WORKER_EXIT_CODE=0
@@ -283,8 +287,21 @@ done
 kill -9 "${COMFY_PIDS[@]}" 2>/dev/null || true
 
 # ==============================================================================
-# 6. Aggregate Stats & Finalize Session
+# 6. Session Teardown Guard & Aggregation
 # ==============================================================================
+UPTIME_SEC=$(( $(date +%s) - START_BOOT_TIME ))
+
+# Guard against self-destruction on early boot failure
+if [ "$UPTIME_SEC" -lt 60 ] && [ "$WORKER_EXIT_CODE" -ne 0 ]; then
+    echo "======================================================================"
+    echo "[CRITICAL SAFETY GUARD] Workers failed within ${UPTIME_SEC}s of startup!"
+    echo "[CRITICAL SAFETY GUARD] Exit Code: ${WORKER_EXIT_CODE}. Preventing instant VM destruction."
+    echo "[CRITICAL SAFETY GUARD] Sleeping for 3600s so you can inspect the issue."
+    echo "======================================================================"
+    sleep 3600
+    exit 1
+fi
+
 echo "[Billing] Finalizing worker session via /v1/worker/off..."
 
 STATS_DATA=$(node -e "
@@ -325,26 +342,20 @@ curl -s -X POST "${API_BASE_URL}/v1/worker/off" \
     -H "x-machine-id: ${MACHINE_ID}" \
     -d "${OFF_PAYLOAD}" || true
 
-echo "[Billing] Session closed. Jobs: ${JOBS_PROCESSED}, Total Time: ${TOTAL_GEN_TIME}s."
-
 # ==============================================================================
-# 7. Cloud Teardown & Auto-Shutdown
+# 7. Cloud Self-Termination
 # ==============================================================================
 
-# --- Lium Pod Self-Termination ---
 if [ "$RUNNER_PLATFORM" = "lium" ] && [ -n "$LIUM_POD_ID" ]; then
     echo "[Teardown] Calling Lium DELETE /api/pods/${LIUM_POD_ID}..."
     LIUM_BASE_URL="${LIUM_BASE_URL:-https://lium.io/api}"
-    DELETE_RES=$(curl -s -X DELETE "${LIUM_BASE_URL}/pods/${LIUM_POD_ID}" \
+    curl -s -X DELETE "${LIUM_BASE_URL}/pods/${LIUM_POD_ID}" \
         -H "X-API-Key: ${LIUM_API_KEY}" \
-        -H "Accept: application/json" || true)
-    echo "[Teardown] Lium Response: ${DELETE_RES}"
+        -H "Accept: application/json" || true
 
-# --- Hyperstack Hibernation ---
 elif [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
-    echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${HYPERSTACK_VM_NAME}..."
+    echo "[Teardown] Requesting Hyperstack VM Hibernation..."
     HYPERSTACK_API_URL="${HYPERSTACK_API_URL:-https://infrahub-api.nexgencloud.com/v1}"
-    
     VM_ID=$(curl -s -H "api_key: ${HYPERSTACK_API_KEY}" -H "accept: application/json" \
         "${HYPERSTACK_API_URL}/core/virtual-machines" | \
         node -e "
@@ -355,30 +366,19 @@ elif [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
                 if (match) process.stdout.write(String(match.id));
             } catch (_) {}
         ")
-
     if [ -n "$VM_ID" ]; then
-        echo "[Teardown] Hibernating VM ${VM_ID}..."
         curl -s -H "api_key: ${HYPERSTACK_API_KEY}" \
             "${HYPERSTACK_API_URL}/core/virtual-machines/${VM_ID}/hibernate?retain_ip=true" || true
     fi
 
-# --- Vast.ai Stop Instance ---
 elif [ "$RUNNER_PLATFORM" = "vastai" ]; then
-    echo "[Teardown] Shutting down Vast.ai instance to prevent idle compute charges..."
-    
     VAST_ID="${CONTAINER_ID:-${VAST_CONTAINERLABEL:-${MACHINE_ID}}}"
-
     if [ -n "$CONTAINER_API_KEY" ] && [ -n "$VAST_ID" ]; then
-        echo "[Teardown] Calling Vast.ai REST API for instance ${VAST_ID}..."
         curl -s -X PUT "https://console.vast.ai/api/v0/instances/${VAST_ID}/" \
             -H "Authorization: Bearer ${CONTAINER_API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{"state": "stopped"}' || true
-    elif command -v vastai >/dev/null 2>&1 && [ -n "$VAST_ID" ]; then
-        echo "[Teardown] Calling vastai CLI for instance ${VAST_ID}..."
-        vastai stop instance "$VAST_ID" || true
     else
-        echo "[Teardown] Terminating PID 1..."
         kill -s TERM 1 2>/dev/null || true
     fi
 fi
