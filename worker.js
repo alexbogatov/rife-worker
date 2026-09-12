@@ -60,34 +60,58 @@ const sync_stats_to_disk = async () => {
       jobs_processed,
       total_generation_time_sec: Math.round(total_generation_time_sec * 100) / 100
     }));
-  } catch (_) {}
+  } catch (err) {
+    console.error(`\x1b[31m${TAG} Failed to write stats to disk: ${err.message}\x1b[0m`);
+  }
 };
 
 const poll_for_job = async () => {
+  const payload = {
+    session_id: WORKER_SESSION_ID,
+    worker_id: UNIQUE_WORKER_ID,
+    slot: WORKER_SUFFIX,
+    job_type: JOB_TYPE,
+    model: MODEL_TYPE,
+    models: MODEL_TYPE
+  };
+
   try {
     const res = await fetch(`${API_BASE_URL}/v1/worker/get`, {
       method: 'POST',
       headers: get_api_headers(),
-      body: JSON.stringify({
-        session_id: WORKER_SESSION_ID,
-        worker_id: UNIQUE_WORKER_ID,
-        slot: WORKER_SUFFIX,
-        job_type: JOB_TYPE,
-        model: MODEL_TYPE,
-        models: MODEL_TYPE
-      })
+      body: JSON.stringify(payload)
     });
-    if (!res.ok) return null;
-    return await res.json();
+
+    const bodyText = await res.text();
+
+    if (!res.ok) {
+      console.error(`\x1b[31m${TAG} API Poll HTTP Error ${res.status} ${res.statusText}: ${bodyText}\x1b[0m`);
+      return null;
+    }
+
+    let json;
+    try {
+      json = JSON.parse(bodyText);
+    } catch (parseErr) {
+      console.error(`\x1b[31m${TAG} Failed to parse API Poll JSON response: ${bodyText}\x1b[0m`);
+      return null;
+    }
+
+    if (!json.success || !json.data) {
+      console.log(`${TAG} Queue empty / no job returned: ${JSON.stringify(json)}`);
+      return null;
+    }
+
+    return await prepare_job(json.data);
   } catch (err) {
-    console.error(`\x1b[31m${TAG} API Poll Error: ${err.message}\x1b[0m`);
+    console.error(`\x1b[31m${TAG} API Poll Network Error: ${err.message}\x1b[0m`);
     return null;
   }
 };
 
 const complete_job = async (job_id, output_url, generation_time_sec) => {
   try {
-    await fetch(`${API_BASE_URL}/v1/worker/complete`, {
+    const res = await fetch(`${API_BASE_URL}/v1/worker/complete`, {
       method: 'POST',
       headers: get_api_headers(),
       body: JSON.stringify({
@@ -98,17 +122,23 @@ const complete_job = async (job_id, output_url, generation_time_sec) => {
         generation_time_sec,
       }),
     });
-    jobs_processed += 1;
-    total_generation_time_sec += generation_time_sec;
-    await sync_stats_to_disk();
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`\x1b[31m${TAG} Complete API rejected HTTP ${res.status}: ${errText}\x1b[0m`);
+    } else {
+      jobs_processed += 1;
+      total_generation_time_sec += generation_time_sec;
+      await sync_stats_to_disk();
+    }
   } catch (err) {
-    console.error(`\x1b[31m${TAG} Complete API Error: ${err.message}\x1b[0m`);
+    console.error(`\x1b[31m${TAG} Complete API Network Error [${job_id}]: ${err.message}\x1b[0m`);
   }
 };
 
 const fail_job = async (job_id, error_message) => {
   try {
-    await fetch(`${API_BASE_URL}/v1/worker/fail`, {
+    const res = await fetch(`${API_BASE_URL}/v1/worker/fail`, {
       method: 'POST',
       headers: get_api_headers(),
       body: JSON.stringify({
@@ -118,8 +148,13 @@ const fail_job = async (job_id, error_message) => {
         error_message: String(error_message)
       }),
     });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`\x1b[31m${TAG} Fail API call rejected HTTP ${res.status}: ${errText}\x1b[0m`);
+    }
   } catch (err) {
-    console.error(`\x1b[31m${TAG} Fail API Error: ${err.message}\x1b[0m`);
+    console.error(`\x1b[31m${TAG} Fail API Network Error [${job_id}]: ${err.message}\x1b[0m`);
   }
 };
 
@@ -140,7 +175,9 @@ const free_comfy_vram = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ unload_models: false, free_memory: true }),
     });
-  } catch (_) {}
+  } catch (err) {
+    console.warn(`${TAG} ComfyUI VRAM flush notice: ${err.message}`);
+  }
 };
 
 const mutate_workflow = (workflow, { input_filename, multiplier = 4 }) => {
@@ -260,6 +297,10 @@ const prepare_job = async (job_data) => {
   const video_url = input.video_url || job_data.video_url;
   const multiplier = input.multiplier || job_data.multiplier || 4;
 
+  if (!video_url) {
+    throw new Error(`Job [${job_id}] payload is missing a valid video_url`);
+  }
+
   const ext = video_url.includes('.webm') ? 'webm' : 'mp4';
   const input_filename = `${WORKER_SUFFIX}_${job_id}_input.${ext}`;
   const input_path = await download_video(video_url, input_filename);
@@ -270,11 +311,9 @@ const prepare_job = async (job_data) => {
 
 const prefetch_next_job = async () => {
   try {
-    const result = await poll_for_job();
-    if (!result?.success || !result?.data) return null;
-    return await prepare_job(result.data);
+    return await poll_for_job();
   } catch (err) {
-    console.error(`\x1b[31m${TAG} Prefetch Failed: ${err.message}\x1b[0m`);
+    console.error(`\x1b[31m${TAG} Prefetch error: ${err.message}\x1b[0m`);
     return null;
   }
 };
@@ -297,16 +336,22 @@ const worker_loop = async () => {
       }
 
       if (!current_job) {
-        current_job = await prefetch_next_job();
+        current_job = await poll_for_job();
       }
 
       if (!current_job) {
         empty_poll_count++;
+
         if (empty_poll_count >= MAX_EMPTY_POLLS) {
-          if (active_uploads.size > 0) await Promise.allSettled(Array.from(active_uploads));
+          console.warn(`\x1b[33m${TAG} Reached MAX_EMPTY_POLLS (${MAX_EMPTY_POLLS}). Shutting down worker...\x1b[0m`);
+          if (active_uploads.size > 0) {
+            console.log(`${TAG} Awaiting ${active_uploads.size} remaining background upload(s)...`);
+            await Promise.allSettled(Array.from(active_uploads));
+          }
           await sync_stats_to_disk();
           process.exit(0);
         }
+
         await sleep(POLL_INTERVAL_SECONDS * 1000);
         continue;
       }
@@ -342,13 +387,12 @@ const worker_loop = async () => {
         }
         await fail_job(current_job.job_id, render_err.message);
       } finally {
-        // Proactively dump CUDA cache after each render
         await free_comfy_vram();
       }
 
       current_job = null;
     } catch (loop_err) {
-      console.error(`\x1b[31m${TAG} Unexpected Loop Error: ${loop_err.message}\x1b[0m`);
+      console.error(`\x1b[31m${TAG} Critical Uncaught Loop Error: ${loop_err.message}\x1b[0m`);
       await sleep(POLL_INTERVAL_SECONDS * 1000);
     }
   }
