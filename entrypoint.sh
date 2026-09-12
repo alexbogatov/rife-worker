@@ -33,7 +33,7 @@ is_hyperstack() {
         return 0
     fi
 
-    if [ -d "/etc/hyperstack" ] || [ -f "/var/log/hyperstack-init.log" ]; then
+    if [ -d "/etc/hyperstack" ] || [ -f "/var/log/hyperstack-init.log" ] || [ -n "$HYPERSTACK_API_KEY" ]; then
         return 0
     fi
 
@@ -65,6 +65,7 @@ fi
 
 MACHINE_ID=$(hostname)
 API_BASE_URL="${API_BASE_URL:-https://api.runltx.com}"
+HYPERSTACK_VM_NAME="${VM_NAME:-${MACHINE_ID}}"
 
 echo "[Platform] Runtime  : $RUNNER_PLATFORM"
 echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($RUNNER_GPU_COUNT detected, $RUNNER_GPU_VRAM VRAM)"
@@ -122,7 +123,6 @@ ln -sfn "${MODEL_DIR}" /app/ComfyUI/models
 ln -sfn "${PERSISTENT_DIR}/ComfyUI/input" /app/ComfyUI/input
 ln -sfn "${PERSISTENT_DIR}/ComfyUI/output" /app/ComfyUI/output
 
-# Clean up stale stats files from previous runs
 rm -f /tmp/worker_stats_*.json /tmp/worker_stats.json
 
 # ==============================================================================
@@ -241,8 +241,8 @@ STATS_DATA=$(node -e "
     console.log(JSON.stringify({ jobs, duration: Math.round(duration) }));
 ")
 
-JOBS_PROCESSED=$(echo "$STATS_DATA" | node -e "const d=JSON.parse(fs.readFileSync(0,'utf-8')); console.log(d.jobs);")
-TOTAL_GEN_TIME=$(echo "$STATS_DATA" | node -e "const d=JSON.parse(fs.readFileSync(0,'utf-8')); console.log(d.duration);")
+JOBS_PROCESSED=$(echo "$STATS_DATA" | node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync(0,'utf-8')); console.log(d.jobs || 0);")
+TOTAL_GEN_TIME=$(echo "$STATS_DATA" | node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync(0,'utf-8')); console.log(d.duration || 0);")
 
 OFF_PAYLOAD=$(cat <<EOF
 {
@@ -263,12 +263,12 @@ curl -s -X POST "${API_BASE_URL}/v1/worker/off" \
 echo "[Billing] Session closed. Jobs: ${JOBS_PROCESSED}, Total Time: ${TOTAL_GEN_TIME}s."
 
 # ==============================================================================
-# 7. Cloud Teardown & Auto-Shutdown
+# 7. Cloud Teardown & Auto-Shutdown (Instance-level)
 # ==============================================================================
 
 # --- Hyperstack Hibernation ---
 if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
-    echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${MACHINE_ID}..."
+    echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${HYPERSTACK_VM_NAME}..."
     HYPERSTACK_API_URL="${HYPERSTACK_API_URL:-https://infrahub-api.nexgencloud.com/v1}"
     
     VM_ID=$(curl -s -H "api_key: ${HYPERSTACK_API_KEY}" -H "accept: application/json" \
@@ -277,7 +277,7 @@ if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
             const fs = require('fs');
             try {
                 const data = JSON.parse(fs.readFileSync(0, 'utf-8'));
-                const match = (data.instances || []).find(v => v.name && v.name.toLowerCase() === '${MACHINE_ID}'.toLowerCase());
+                const match = (data.instances || []).find(v => v.name && v.name.toLowerCase() === '${HYPERSTACK_VM_NAME}'.toLowerCase());
                 if (match) process.stdout.write(String(match.id));
             } catch (_) {}
         ")
@@ -304,7 +304,7 @@ elif [ "$RUNNER_PLATFORM" = "vastai" ]; then
         echo "[Teardown] Calling vastai CLI for instance ${VAST_ID}..."
         vastai stop instance "$VAST_ID" || true
     else
-        echo "[Teardown] No Vast API key or CLI found inside container. Terminating PID 1..."
+        echo "[Teardown] Terminating PID 1..."
         kill -s TERM 1 2>/dev/null || true
     fi
 fi
