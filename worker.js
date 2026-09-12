@@ -170,15 +170,32 @@ const execute_workflow = async (workflow) => {
 
         const duration = (Date.now() - start_time) / 1000;
         const outputs = job_history.outputs || {};
-        for (const nodeId in outputs) {
-          const vids = outputs[nodeId].videos || outputs[nodeId].gifs || outputs[nodeId].images;
-          if (vids && vids.length > 0) {
-            const vid = vids[0];
-            const sub = vid.subfolder ? `${vid.subfolder}/` : '';
-            return { output_path: join(OUTPUT_DIR, `${sub}${vid.filename}`), duration };
+
+        // 1. Prefer Node 7 directly (the Save Video node)
+        const saveNodeOutput = outputs['7'];
+        const mediaList = saveNodeOutput?.gifs || saveNodeOutput?.videos || saveNodeOutput?.images;
+
+        if (mediaList && mediaList.length > 0) {
+          const item = mediaList[0];
+          const sub = item.subfolder ? `${item.subfolder}/` : '';
+          return { output_path: join(OUTPUT_DIR, `${sub}${item.filename}`), duration };
+        }
+
+        // 2. Fallback: find any output entry with type === 'output'
+        for (const nodeId of Object.keys(outputs)) {
+          for (const key of ['gifs', 'videos', 'images']) {
+            const list = outputs[nodeId][key];
+            if (Array.isArray(list)) {
+              const outItem = list.find(v => v.type === 'output');
+              if (outItem) {
+                const sub = outItem.subfolder ? `${outItem.subfolder}/` : '';
+                return { output_path: join(OUTPUT_DIR, `${sub}${outItem.filename}`), duration };
+              }
+            }
           }
         }
-        throw new Error('No video output found in completed workflow history');
+
+        throw new Error('No valid output video found in completed workflow history');
       }
     }
   }
