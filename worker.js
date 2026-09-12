@@ -1,16 +1,57 @@
 import os from 'os';
-import { readFileSync, createReadStream, existsSync } from 'fs';
+import { readFileSync, createReadStream, existsSync, statSync } from 'fs';
 import { mkdir, writeFile, unlink, rename } from 'fs/promises';
 import { join } from 'path';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
 process.removeAllListeners('warning');
 
-const WORKER_SUFFIX = process.env.WORKER_SUFFIX || 'worker_1';
-const COMFY_PORT = parseInt(process.env.COMFY_PORT, 10) || 8188;
+// ==============================================================================
+// Strict Environment Validation (No Fallbacks)
+// ==============================================================================
+const REQUIRED_ENV_VARS = [
+  'WORKER_SUFFIX',
+  'COMFY_PORT',
+  'WORKFLOW_FILE',
+  'API_BASE_URL',
+  'WORKER_API_SECRET',
+  'WORKER_SESSION_ID',
+  'JOB_TYPE',
+  'MODEL',
+  'POLL_INTERVAL_SECONDS',
+  'MAX_EMPTY_POLLS',
+  'R2_ACCOUNT_ID',
+  'R2_ACCESS_KEY_ID',
+  'R2_SECRET_ACCESS_KEY',
+  'R2_BUCKET_NAME',
+  'R2_CDN_URL'
+];
+
+const missing_vars = REQUIRED_ENV_VARS.filter((key) => {
+  const val = process.env[key];
+  return val === undefined || val === null || val.trim() === '';
+});
+
+if (missing_vars.length > 0) {
+  console.error(`\x1b[31m[FATAL] Missing required environment variable(s):\n  - ${missing_vars.join('\n  - ')}\x1b[0m`);
+  process.exit(1);
+}
+
+const WORKER_SUFFIX = process.env.WORKER_SUFFIX;
+const COMFY_PORT = parseInt(process.env.COMFY_PORT, 10);
+if (isNaN(COMFY_PORT)) {
+  console.error(`\x1b[31m[FATAL] COMFY_PORT must be an integer, got: "${process.env.COMFY_PORT}"\x1b[0m`);
+  process.exit(1);
+}
+
 const COMFY_HOST = `http://127.0.0.1:${COMFY_PORT}`;
-const WORKFLOW_FILE = process.env.WORKFLOW_FILE || 'rife_v4.26_heavy.json';
+const WORKFLOW_FILE = process.env.WORKFLOW_FILE;
 const WORKFLOW_PATH = join(process.cwd(), WORKFLOW_FILE);
+
+if (!existsSync(WORKFLOW_PATH)) {
+  console.error(`\x1b[31m[FATAL] Workflow JSON file not found at: ${WORKFLOW_PATH}\x1b[0m`);
+  process.exit(1);
+}
 
 const WORKER_NUM = (WORKER_SUFFIX.match(/\d+/) ? WORKER_SUFFIX.match(/\d+/)[0] : '1').padStart(3, '0');
 const TAG = `[ ${WORKER_NUM} ]`;
@@ -22,26 +63,37 @@ const OUTPUT_DIR = join(BASE_COMFY_DIR, 'output');
 const MACHINE_ID = os.hostname();
 const UNIQUE_WORKER_ID = `${MACHINE_ID}-${WORKER_SUFFIX}`;
 const WORKER_API_SECRET = process.env.WORKER_API_SECRET;
-const WORKER_SESSION_ID = process.env.WORKER_SESSION_ID || null;
+const WORKER_SESSION_ID = process.env.WORKER_SESSION_ID;
+
+const API_BASE_URL = process.env.API_BASE_URL;
+const JOB_TYPE = process.env.JOB_TYPE;
+const MODEL_TYPE = process.env.MODEL;
+const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10);
+const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10);
+
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
+const R2_CDN_URL = process.env.R2_CDN_URL;
 
 const active_uploads = new Set();
 const STATS_FILE = `/tmp/worker_stats_${WORKER_SUFFIX}.json`;
 let jobs_processed = 0;
 let total_generation_time_sec = 0;
 
-const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
-const JOB_TYPE = process.env.JOB_TYPE || 'interpolate';
-const MODEL_TYPE = process.env.MODEL || process.env.MODEL_TYPE || 'interpolate-video';
-const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 1;
-const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
-
+// S3 Client with connection/socket timeouts to prevent hanging on dropped connections
 const s3_client = new S3Client({
   region: 'auto',
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
+    accessKeyId: R2_ACCESS_KEY_ID,
+    secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
+  requestHandler: {
+    requestTimeout: 60000,
+    connectionTimeout: 10000,
+  }
 });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -79,7 +131,8 @@ const poll_for_job = async () => {
     const res = await fetch(`${API_BASE_URL}/v1/worker/get`, {
       method: 'POST',
       headers: get_api_headers(),
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15000)
     });
 
     const bodyText = await res.text();
@@ -98,7 +151,6 @@ const poll_for_job = async () => {
     }
 
     if (!json.success || !json.data) {
-      console.log(`${TAG} Queue empty / no job returned: ${JSON.stringify(json)}`);
       return null;
     }
 
@@ -111,6 +163,7 @@ const poll_for_job = async () => {
 
 const complete_job = async (job_id, output_url, generation_time_sec) => {
   try {
+    console.log(`${TAG} Completing job [${job_id}] via API...`);
     const res = await fetch(`${API_BASE_URL}/v1/worker/complete`, {
       method: 'POST',
       headers: get_api_headers(),
@@ -121,6 +174,7 @@ const complete_job = async (job_id, output_url, generation_time_sec) => {
         output_url,
         generation_time_sec,
       }),
+      signal: AbortSignal.timeout(15000)
     });
 
     if (!res.ok) {
@@ -147,6 +201,7 @@ const fail_job = async (job_id, error_message) => {
         job_id,
         error_message: String(error_message)
       }),
+      signal: AbortSignal.timeout(15000)
     });
 
     if (!res.ok) {
@@ -161,7 +216,7 @@ const fail_job = async (job_id, error_message) => {
 const wait_for_comfy_ready = async () => {
   while (true) {
     try {
-      const res = await fetch(`${COMFY_HOST}/history`);
+      const res = await fetch(`${COMFY_HOST}/history`, { signal: AbortSignal.timeout(3000) });
       if (res.ok) break;
     } catch (_) {}
     await sleep(250);
@@ -174,15 +229,16 @@ const free_comfy_vram = async () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ unload_models: false, free_memory: true }),
+      signal: AbortSignal.timeout(5000)
     });
   } catch (err) {
     console.warn(`${TAG} ComfyUI VRAM flush notice: ${err.message}`);
   }
 };
 
-const mutate_workflow = (workflow, { input_filename, multiplier = 4 }) => {
+const mutate_workflow = (workflow, { input_filename, multiplier }) => {
   if (workflow['4']?.inputs) workflow['4'].inputs.file = input_filename;
-  if (workflow['16:9']?.inputs) workflow['16:9'].inputs.value = parseInt(multiplier, 10) || 4;
+  if (workflow['16:9']?.inputs) workflow['16:9'].inputs.value = parseInt(multiplier, 10);
   if (workflow['7']?.inputs) workflow['7'].inputs.filename_prefix = `video/${WORKER_SUFFIX}_ComfyUI`;
   return workflow;
 };
@@ -192,6 +248,7 @@ const execute_workflow = async (workflow) => {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: workflow }),
+    signal: AbortSignal.timeout(15000)
   });
 
   const resJson = await response.json();
@@ -206,48 +263,54 @@ const execute_workflow = async (workflow) => {
 
   while (true) {
     await sleep(250);
-    const history_res = await fetch(`${COMFY_HOST}/history/${prompt_id}`);
-    if (history_res.ok) {
-      const history_data = await history_res.json();
-      const job_history = history_data[prompt_id];
-      if (job_history) {
-        if (job_history.status?.status_str === 'error') {
-          throw new Error(`ComfyUI Execution Error: ${JSON.stringify(job_history.status)}`);
-        }
+    try {
+      const history_res = await fetch(`${COMFY_HOST}/history/${prompt_id}`, { signal: AbortSignal.timeout(5000) });
+      if (history_res.ok) {
+        const history_data = await history_res.json();
+        const job_history = history_data[prompt_id];
+        if (job_history) {
+          if (job_history.status?.status_str === 'error') {
+            throw new Error(`ComfyUI Execution Error: ${JSON.stringify(job_history.status)}`);
+          }
 
-        const duration = (Date.now() - start_time) / 1000;
-        const outputs = job_history.outputs || {};
+          const duration = (Date.now() - start_time) / 1000;
+          const outputs = job_history.outputs || {};
 
-        const saveNodeOutput = outputs['7'];
-        const mediaList = saveNodeOutput?.gifs || saveNodeOutput?.videos || saveNodeOutput?.images;
+          const saveNodeOutput = outputs['7'];
+          const mediaList = saveNodeOutput?.gifs || saveNodeOutput?.videos || saveNodeOutput?.images;
 
-        if (mediaList && mediaList.length > 0) {
-          const item = mediaList[0];
-          const sub = item.subfolder ? `${item.subfolder}/` : '';
-          return { output_path: join(OUTPUT_DIR, `${sub}${item.filename}`), duration };
-        }
+          if (mediaList && mediaList.length > 0) {
+            const item = mediaList[0];
+            const sub = item.subfolder ? `${item.subfolder}/` : '';
+            return { output_path: join(OUTPUT_DIR, `${sub}${item.filename}`), duration };
+          }
 
-        for (const nodeId of Object.keys(outputs)) {
-          for (const key of ['gifs', 'videos', 'images']) {
-            const list = outputs[nodeId][key];
-            if (Array.isArray(list)) {
-              const outItem = list.find((v) => v.type === 'output');
-              if (outItem) {
-                const sub = outItem.subfolder ? `${outItem.subfolder}/` : '';
-                return { output_path: join(OUTPUT_DIR, `${sub}${outItem.filename}`), duration };
+          for (const nodeId of Object.keys(outputs)) {
+            for (const key of ['gifs', 'videos', 'images']) {
+              const list = outputs[nodeId][key];
+              if (Array.isArray(list)) {
+                const outItem = list.find((v) => v.type === 'output');
+                if (outItem) {
+                  const sub = outItem.subfolder ? `${outItem.subfolder}/` : '';
+                  return { output_path: join(OUTPUT_DIR, `${sub}${outItem.filename}`), duration };
+                }
               }
             }
           }
-        }
 
-        throw new Error('No valid output video found in completed workflow history');
+          throw new Error('No valid output video found in completed workflow history');
+        }
+      }
+    } catch (pollErr) {
+      if (pollErr.message.includes('ComfyUI Execution Error') || pollErr.message.includes('No valid output video')) {
+        throw pollErr;
       }
     }
   }
 };
 
 const download_video = async (url, filename) => {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
   if (!res.ok) throw new Error(`HTTP ${res.status} downloading ${url}`);
 
   const buffer = await res.arrayBuffer();
@@ -267,15 +330,27 @@ const download_video = async (url, filename) => {
 };
 
 const upload_to_r2 = async (file_path, job_id) => {
+  if (!existsSync(file_path)) {
+    throw new Error(`File not found for R2 upload at path: ${file_path}`);
+  }
+
   const ext = file_path.endsWith('.webm') ? 'webm' : 'mp4';
   const key = `interpolations/${job_id}.${ext}`;
+  const contentType = ext === 'webm' ? 'video/webm' : 'video/mp4';
+  const file_size = statSync(file_path).size;
+
+  console.log(`${TAG} [upload] Sending ${file_path} (${(file_size / 1024 / 1024).toFixed(2)} MB) to R2 key: ${key}...`);
+
   await s3_client.send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME,
+    Bucket: R2_BUCKET_NAME,
     Key: key,
     Body: createReadStream(file_path),
-    ContentType: ext === 'webm' ? 'video/webm' : 'video/mp4',
+    ContentLength: file_size,
+    ContentType: contentType,
   }));
-  return `${process.env.R2_CDN_URL}/${key}`;
+
+  console.log(`${TAG} [upload] Finished uploading ${key} to R2.`);
+  return `${R2_CDN_URL}/${key}`;
 };
 
 const upload_and_complete_async = async (job_id, isolated_path, duration) => {
