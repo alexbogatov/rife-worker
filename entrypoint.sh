@@ -320,7 +320,7 @@ for row in $(echo "$PLAN_JSON" | node -e "const fs=require('fs'); JSON.parse(fs.
     WORKER_SUFFIX="worker_${IDX}" \
     COMFY_PORT="${PORT}" \
     WORKER_SESSION_ID="${WORKER_SESSION_ID}" \
-    node worker.js >> "${LOG_DIR}/worker_${IDX}.log" 2>&1 &
+    node worker.js &
     
     WORKER_PIDS+=($!)
     echo $! >> /tmp/node_worker_pids.txt
