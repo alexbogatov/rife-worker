@@ -28,62 +28,42 @@ discover_lium_pod_id() {
     fi
 
     local lium_base="${LIUM_BASE_URL:-https://lium.io/api}"
-    local pods_json
-    pods_json=$(curl -s --connect-timeout 5 -X GET "${lium_base}/pods" \
-        -H "X-API-Key: ${LIUM_API_KEY}" \
-        -H "Accept: application/json" 2>/dev/null || echo '[]')
 
-    local my_host
-    my_host=$(hostname)
-    local my_ip
-    my_ip=$(curl -s4 --connect-timeout 3 https://ifconfig.me || curl -s4 --connect-timeout 3 https://api.ipify.org || true)
+    python3 -c '
+import json, urllib.request, socket, sys
 
-    node -e "
-        const raw = process.argv[1];
-        const host = '${my_host}'.trim().toLowerCase();
-        const ip = '${my_ip}'.trim();
+api_key = sys.argv[1]
+base_url = sys.argv[2]
+host = socket.gethostname().strip().lower()
 
-        try {
-            const data = JSON.parse(raw);
-            const pods = Array.isArray(data) ? data : (data.data || data.pods || []);
-            if (!pods.length) process.exit(1);
+req = urllib.request.Request(f"{base_url}/pods", headers={"X-API-Key": api_key, "Accept": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.loads(resp.read().decode())
+        pods = data if isinstance(data, list) else data.get("data", data.get("pods", []))
+        if not pods:
+            sys.exit(1)
 
-            let matchedPod = null;
+        match = None
+        for p in pods:
+            containers = p.get("executor", {}).get("specs", {}).get("docker", {}).get("containers", [])
+            if any(c.get("container_id", "").lower().startswith(host) for c in containers):
+                match = p
+                break
 
-            // 1. Exact match: Look for hostname inside executor.specs.docker.containers.container_id
-            for (const pod of pods) {
-                const containers = pod.executor?.specs?.docker?.containers || [];
-                if (containers.some(c => c.container_id && c.container_id.toLowerCase().startsWith(host))) {
-                    matchedPod = pod;
-                    break;
-                }
-            }
+        if not match and len(pods) == 1:
+            match = pods[0]
 
-            // 2. Fallback: Check if host string exists anywhere inside the pod record
-            if (!matchedPod && host) {
-                matchedPod = pods.find(p => JSON.stringify(p).toLowerCase().includes(host));
-            }
+        if match:
+            pod_id = match.get("id") or match.get("uuid") or match.get("pod_id")
+            if pod_id:
+                sys.stdout.write(str(pod_id))
+                sys.exit(0)
+except Exception:
+    pass
 
-            // 3. Fallback: Match by public IP inside ssh_connect_cmd or executor_ip_address
-            if (!matchedPod && ip) {
-                matchedPod = pods.find(p => 
-                    (p.ssh_connect_cmd && p.ssh_connect_cmd.includes(ip)) ||
-                    (p.executor?.executor_ip_address === ip)
-                );
-            }
-
-            // 4. Single active pod fallback
-            if (!matchedPod && pods.length === 1) {
-                matchedPod = pods[0];
-            }
-
-            if (matchedPod && (matchedPod.id || matchedPod.uuid || matchedPod.pod_id)) {
-                process.stdout.write(String(matchedPod.id || matchedPod.uuid || matchedPod.pod_id));
-                process.exit(0);
-            }
-        } catch (_) {}
-        process.exit(1);
-    " "$pods_json"
+sys.exit(1)
+' "$LIUM_API_KEY" "$lium_base"
 }
 
 is_hyperstack() {
