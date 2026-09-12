@@ -1,350 +1,399 @@
-import os from 'os';
-import { readFileSync, createReadStream, existsSync } from 'fs';
-import { mkdir, writeFile, unlink, rename } from 'fs/promises';
-import { join } from 'path';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+#!/bin/bash
+set -eo pipefail
 
-process.removeAllListeners('warning');
+export GIT_TERMINAL_PROMPT=0
 
-const WORKER_SUFFIX = process.env.WORKER_SUFFIX || 'worker_1';
-const COMFY_PORT = parseInt(process.env.COMFY_PORT, 10) || 8188;
-const COMFY_HOST = `http://127.0.0.1:${COMFY_PORT}`;
-const WORKFLOW_FILE = process.env.WORKFLOW_FILE || 'rife_v4.26_heavy.json';
-const WORKFLOW_PATH = join(process.cwd(), WORKFLOW_FILE);
+# ==============================================================================
+# Global Logging & Initialization
+# ==============================================================================
+LOG_DIR="${LOG_DIR:-/var/log/runner}"
+mkdir -p "${LOG_DIR}"
 
-const WORKER_NUM = (WORKER_SUFFIX.match(/\d+/) ? WORKER_SUFFIX.match(/\d+/)[0] : '1').padStart(3, '0');
-const TAG = `[ ${WORKER_NUM} ]`;
+# Mirror entrypoint stdout/stderr to disk and terminal
+exec > >(tee -a "${LOG_DIR}/entrypoint.log") 2>&1
 
-const BASE_COMFY_DIR = existsSync('/app/ComfyUI') ? '/app/ComfyUI' : join(process.cwd(), 'ComfyUI');
-const INPUT_DIR = join(BASE_COMFY_DIR, 'input');
-const OUTPUT_DIR = join(BASE_COMFY_DIR, 'output');
+TOTAL_INSTANCES="${INSTANCES:-12}"
 
-const MACHINE_ID = os.hostname();
-const UNIQUE_WORKER_ID = `${MACHINE_ID}-${WORKER_SUFFIX}`;
-const WORKER_API_SECRET = process.env.WORKER_API_SECRET;
-const WORKER_SESSION_ID = process.env.WORKER_SESSION_ID || null;
+echo "===================================================="
+echo "[Startup] Initializing ${TOTAL_INSTANCES}x Parallel ComfyUI Workers"
+echo "===================================================="
 
-const active_uploads = new Set();
-const STATS_FILE = `/tmp/worker_stats_${WORKER_SUFFIX}.json`;
-let jobs_processed = 0;
-let total_generation_time_sec = 0;
+# ==============================================================================
+# 1. Platform & GPU Auto-Discovery
+# ==============================================================================
 
-const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
-const JOB_TYPE = process.env.JOB_TYPE || 'interpolate';
-const MODEL_TYPE = process.env.MODEL || process.env.MODEL_TYPE || 'interpolate-video';
-const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 1;
-const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
+discover_lium_pod_id() {
+    if [ -z "$LIUM_API_KEY" ]; then
+        return 1
+    fi
 
-const s3_client = new S3Client({
-  region: 'auto',
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
-  },
-});
+    local lium_base="${LIUM_BASE_URL:-https://lium.io/api}"
+    local pods_json
+    pods_json=$(curl -s --connect-timeout 5 -X GET "${lium_base}/pods" \
+        -H "X-API-Key: ${LIUM_API_KEY}" \
+        -H "Accept: application/json" 2>/dev/null || echo '[]')
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    local my_host
+    my_host=$(hostname)
+    local my_ip
+    my_ip=$(curl -s4 --connect-timeout 3 https://ifconfig.me || curl -s4 --connect-timeout 3 https://api.ipify.org || true)
 
-const get_api_headers = () => ({
-  'worker-auth': WORKER_API_SECRET,
-  'x-machine-id': MACHINE_ID,
-  'x-worker-id': UNIQUE_WORKER_ID,
-  'content-type': 'application/json'
-});
+    node -e "
+        const raw = process.argv[1];
+        const host = '${my_host}'.trim().toLowerCase();
+        const ip = '${my_ip}'.trim();
 
-const sync_stats_to_disk = async () => {
-  try {
-    await writeFile(STATS_FILE, JSON.stringify({
-      worker: UNIQUE_WORKER_ID,
-      jobs_processed,
-      total_generation_time_sec: Math.round(total_generation_time_sec * 100) / 100
-    }));
-  } catch (_) {}
-};
+        try {
+            const data = JSON.parse(raw);
+            const pods = Array.isArray(data) ? data : (data.data || data.pods || []);
+            if (!pods.length) process.exit(1);
 
-const poll_for_job = async () => {
-  try {
-    const res = await fetch(`${API_BASE_URL}/v1/worker/get`, {
-      method: 'POST',
-      headers: get_api_headers(),
-      body: JSON.stringify({
-        session_id: WORKER_SESSION_ID,
-        worker_id: UNIQUE_WORKER_ID,
-        slot: WORKER_SUFFIX,
-        job_type: JOB_TYPE,
-        model: MODEL_TYPE,
-        models: MODEL_TYPE
-      })
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (err) {
-    console.error(`\x1b[31m${TAG} API Poll Error: ${err.message}\x1b[0m`);
-    return null;
-  }
-};
+            let matchedPod = null;
 
-const complete_job = async (job_id, output_url, generation_time_sec) => {
-  try {
-    await fetch(`${API_BASE_URL}/v1/worker/complete`, {
-      method: 'POST',
-      headers: get_api_headers(),
-      body: JSON.stringify({
-        session_id: WORKER_SESSION_ID,
-        worker_id: UNIQUE_WORKER_ID,
-        job_id,
-        output_url,
-        generation_time_sec,
-      }),
-    });
-    jobs_processed += 1;
-    total_generation_time_sec += generation_time_sec;
-    await sync_stats_to_disk();
-  } catch (err) {
-    console.error(`\x1b[31m${TAG} Complete API Error: ${err.message}\x1b[0m`);
-  }
-};
-
-const fail_job = async (job_id, error_message) => {
-  try {
-    await fetch(`${API_BASE_URL}/v1/worker/fail`, {
-      method: 'POST',
-      headers: get_api_headers(),
-      body: JSON.stringify({
-        session_id: WORKER_SESSION_ID,
-        worker_id: UNIQUE_WORKER_ID,
-        job_id,
-        error_message: String(error_message)
-      }),
-    });
-  } catch (err) {
-    console.error(`\x1b[31m${TAG} Fail API Error: ${err.message}\x1b[0m`);
-  }
-};
-
-const wait_for_comfy_ready = async () => {
-  while (true) {
-    try {
-      const res = await fetch(`${COMFY_HOST}/history`);
-      if (res.ok) break;
-    } catch (_) {}
-    await sleep(250);
-  }
-};
-
-const mutate_workflow = (workflow, { input_filename, multiplier = 4 }) => {
-  if (workflow['4']?.inputs) workflow['4'].inputs.file = input_filename;
-  if (workflow['16:9']?.inputs) workflow['16:9'].inputs.value = parseInt(multiplier, 10) || 4;
-  if (workflow['7']?.inputs) workflow['7'].inputs.filename_prefix = `video/${WORKER_SUFFIX}_ComfyUI`;
-  return workflow;
-};
-
-const execute_workflow = async (workflow) => {
-  const response = await fetch(`${COMFY_HOST}/prompt`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt: workflow }),
-  });
-
-  const resJson = await response.json();
-
-  if (!response.ok || resJson.error || !resJson.prompt_id) {
-    const errorDetails = JSON.stringify(resJson.node_errors || resJson.error || resJson);
-    throw new Error(`ComfyUI Prompt Rejected: ${errorDetails}`);
-  }
-
-  const { prompt_id } = resJson;
-  const start_time = Date.now();
-
-  while (true) {
-    await sleep(250);
-    const history_res = await fetch(`${COMFY_HOST}/history/${prompt_id}`);
-    if (history_res.ok) {
-      const history_data = await history_res.json();
-      const job_history = history_data[prompt_id];
-      if (job_history) {
-        if (job_history.status?.status_str === 'error') {
-          throw new Error(`ComfyUI Execution Error: ${JSON.stringify(job_history.status)}`);
-        }
-
-        const duration = (Date.now() - start_time) / 1000;
-        const outputs = job_history.outputs || {};
-
-        // 1. Prioritize node 7 (explicit video output node)
-        const saveNodeOutput = outputs['7'];
-        const mediaList = saveNodeOutput?.gifs || saveNodeOutput?.videos || saveNodeOutput?.images;
-
-        if (mediaList && mediaList.length > 0) {
-          const item = mediaList[0];
-          const sub = item.subfolder ? `${item.subfolder}/` : '';
-          return { output_path: join(OUTPUT_DIR, `${sub}${item.filename}`), duration };
-        }
-
-        // 2. Scan remaining outputs matching media output format
-        for (const nodeId of Object.keys(outputs)) {
-          for (const key of ['gifs', 'videos', 'images']) {
-            const list = outputs[nodeId][key];
-            if (Array.isArray(list)) {
-              const outItem = list.find((v) => v.type === 'output');
-              if (outItem) {
-                const sub = outItem.subfolder ? `${outItem.subfolder}/` : '';
-                return { output_path: join(OUTPUT_DIR, `${sub}${outItem.filename}`), duration };
-              }
+            // 1. Exact match: Look for hostname inside executor.specs.docker.containers.container_id
+            for (const pod of pods) {
+                const containers = pod.executor?.specs?.docker?.containers || [];
+                if (containers.some(c => c.container_id && c.container_id.toLowerCase().startsWith(host))) {
+                    matchedPod = pod;
+                    break;
+                }
             }
-          }
-        }
 
-        throw new Error('No valid output video found in completed workflow history');
-      }
-    }
-  }
-};
+            // 2. Fallback: Check if host string exists anywhere inside the pod record
+            if (!matchedPod && host) {
+                matchedPod = pods.find(p => JSON.stringify(p).toLowerCase().includes(host));
+            }
 
-const download_video = async (url, filename) => {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} downloading ${url}`);
+            // 3. Fallback: Match by public IP inside ssh_connect_cmd or executor_ip_address
+            if (!matchedPod && ip) {
+                matchedPod = pods.find(p => 
+                    (p.ssh_connect_cmd && p.ssh_connect_cmd.includes(ip)) ||
+                    (p.executor?.executor_ip_address === ip)
+                );
+            }
 
-  const buffer = await res.arrayBuffer();
-  if (buffer.byteLength < 1024) {
-    throw new Error(`Downloaded video is empty or corrupt (${buffer.byteLength} bytes)`);
-  }
+            // 4. Single active pod fallback
+            if (!matchedPod && pods.length === 1) {
+                matchedPod = pods[0];
+            }
 
-  await mkdir(INPUT_DIR, { recursive: true });
+            if (matchedPod && (matchedPod.id || matchedPod.uuid || matchedPod.pod_id)) {
+                process.stdout.write(String(matchedPod.id || matchedPod.uuid || matchedPod.pod_id));
+                process.exit(0);
+            }
+        } catch (_) {}
+        process.exit(1);
+    " "$pods_json"
+}
 
-  const temp_path = join(INPUT_DIR, `temp_${Date.now()}_${filename}`);
-  const target_path = join(INPUT_DIR, filename);
+is_hyperstack() {
+    if curl -s --connect-timeout 1 http://169.254.169.254/openstack/latest/meta_data.json 2>/dev/null | grep -qi "nexgen\|hyperstack"; then
+        return 0
+    fi
 
-  // Write to a temporary file first and rename atomically
-  await writeFile(temp_path, Buffer.from(buffer));
-  await rename(temp_path, target_path);
+    local dmi_data
+    dmi_data="$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true)"
+    if echo "$dmi_data" | grep -qi "nexgen\|hyperstack"; then
+        return 0
+    fi
 
-  return target_path;
-};
+    if [ -d "/etc/hyperstack" ] || [ -f "/var/log/hyperstack-init.log" ] || [ -n "$HYPERSTACK_API_KEY" ]; then
+        return 0
+    fi
 
-const upload_to_r2 = async (file_path, job_id) => {
-  const ext = file_path.endsWith('.webm') ? 'webm' : 'mp4';
-  const key = `interpolations/${job_id}.${ext}`;
-  await s3_client.send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME,
-    Key: key,
-    Body: createReadStream(file_path),
-    ContentType: ext === 'webm' ? 'video/webm' : 'video/mp4',
-  }));
-  return `${process.env.R2_CDN_URL}/${key}`;
-};
+    return 1
+}
 
-const upload_and_complete_async = async (job_id, isolated_path, duration) => {
-  try {
-    const r2_url = await upload_to_r2(isolated_path, job_id);
-    await complete_job(job_id, r2_url, duration);
-    console.log(`\x1b[32m${TAG} ✔ Job [${job_id}] finished in ${duration.toFixed(1)}s\x1b[0m`);
-  } catch (err) {
-    console.error(`\x1b[31m${TAG} ✖ Upload/Complete Failed [${job_id}]: ${err.message}\x1b[0m`);
-    await fail_job(job_id, err.message);
-  } finally {
-    try { await unlink(isolated_path); } catch (_) {}
-  }
-};
+# Auto-Discovery Priority
+if [ -n "$MODAL_TASK_ID" ] || [ -n "$MODAL_IS_REMOTE" ] || [ -n "$MODAL_ENVIRONMENT" ]; then
+    export RUNNER_PLATFORM="modal"
+elif [ -n "$VAST_CONTAINERLABEL" ] || [ -n "$CONTAINER_ID" ] || [ -n "$VAST_TCP_PORT_22" ]; then
+    export RUNNER_PLATFORM="vastai"
+elif [ -n "$RUNPOD_POD_ID" ]; then
+    export RUNNER_PLATFORM="runpod"
+elif LIUM_DISCOVERED=$(discover_lium_pod_id); then
+    export LIUM_POD_ID="$LIUM_DISCOVERED"
+    export RUNNER_PLATFORM="lium"
+    echo "[Platform] Verified Lium Pod ID: ${LIUM_POD_ID}"
+elif is_hyperstack; then
+    export RUNNER_PLATFORM="hyperstack"
+else
+    export RUNNER_PLATFORM="generic"
+fi
 
-const prepare_job = async (job_data) => {
-  const { job_id } = job_data;
-  const input = job_data.input || {};
-  const video_url = input.video_url || job_data.video_url;
-  const multiplier = input.multiplier || job_data.multiplier || 4;
+if command -v nvidia-smi &> /dev/null; then
+    export RUNNER_GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1 | xargs)
+    export RUNNER_GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | xargs)
+    export RUNNER_GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -n 1 | xargs)
+else
+    export RUNNER_GPU_NAME="None"
+    export RUNNER_GPU_COUNT="0"
+    export RUNNER_GPU_VRAM="0"
+fi
 
-  const ext = video_url.includes('.webm') ? 'webm' : 'mp4';
-  const input_filename = `${WORKER_SUFFIX}_${job_id}_input.${ext}`;
-  const input_path = await download_video(video_url, input_filename);
-  const workflow = mutate_workflow(JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8')), { input_filename, multiplier });
+MACHINE_ID=$(hostname)
+API_BASE_URL="${API_BASE_URL:-https://api.runltx.com}"
+HYPERSTACK_VM_NAME="${VM_NAME:-${MACHINE_ID}}"
 
-  return { job_id, workflow, downloaded_paths: [input_path] };
-};
+echo "[Platform] Runtime  : $RUNNER_PLATFORM"
+echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($RUNNER_GPU_COUNT detected, $RUNNER_GPU_VRAM VRAM)"
+echo "===================================================="
 
-const prefetch_next_job = async () => {
-  try {
-    const result = await poll_for_job();
-    if (!result?.success || !result?.data) return null;
-    return await prepare_job(result.data);
-  } catch (err) {
-    console.error(`\x1b[31m${TAG} Prefetch Failed: ${err.message}\x1b[0m`);
-    return null;
-  }
-};
+# ==============================================================================
+# 2. CALL /v1/worker/on (Register startup session)
+# ==============================================================================
+echo "[Billing] Registering worker startup session via /v1/worker/on..."
+SESSION_PAYLOAD=$(cat <<EOF
+{
+  "machine_id": "${MACHINE_ID}",
+  "provider": "${RUNNER_PLATFORM}",
+  "gpu_name": "${RUNNER_GPU_NAME}",
+  "gpu_count": ${RUNNER_GPU_COUNT},
+  "gpu_vram": "${RUNNER_GPU_VRAM}"
+}
+EOF
+)
 
-const worker_loop = async () => {
-  await mkdir(INPUT_DIR, { recursive: true });
-  await mkdir(OUTPUT_DIR, { recursive: true });
-  await sync_stats_to_disk();
-  await wait_for_comfy_ready();
+SESSION_RESPONSE=$(curl -s -X POST "${API_BASE_URL}/v1/worker/on" \
+    -H "Content-Type: application/json" \
+    -H "worker-auth: ${WORKER_API_SECRET}" \
+    -H "x-machine-id: ${MACHINE_ID}" \
+    -d "${SESSION_PAYLOAD}" || echo '{"success":false}')
 
-  let current_job = null;
-  let prefetch_promise = null;
-  let empty_poll_count = 0;
-
-  while (true) {
+export WORKER_SESSION_ID=$(echo "$SESSION_RESPONSE" | node -e "
+    const fs = require('fs');
     try {
-      if (prefetch_promise) {
-        current_job = await prefetch_promise;
-        prefetch_promise = null;
-      }
+        const res = JSON.parse(fs.readFileSync(0, 'utf-8'));
+        if (res.success && res.session_id) process.stdout.write(res.session_id);
+    } catch (_) {}
+")
 
-      if (!current_job) {
-        current_job = await prefetch_next_job();
-      }
+if [ -n "$WORKER_SESSION_ID" ]; then
+    echo "[Billing] Active Worker Session ID: ${WORKER_SESSION_ID}"
+else
+    echo "[Billing Warning] Could not initialize session tracking."
+fi
 
-      if (!current_job) {
-        empty_poll_count++;
-        if (empty_poll_count >= MAX_EMPTY_POLLS) {
-          if (active_uploads.size > 0) await Promise.allSettled(Array.from(active_uploads));
-          await sync_stats_to_disk();
-          process.exit(0);
+# ==============================================================================
+# 3. Storage Setup & Symlinks
+# ==============================================================================
+PERSISTENT_DIR="${PERSISTENT_STORAGE_DIR:-/workspace}"
+MODEL_DIR="${PERSISTENT_DIR}/ComfyUI/models"
+
+mkdir -p "${MODEL_DIR}/diffusion_models" \
+         "${MODEL_DIR}/clip" \
+         "${MODEL_DIR}/vae" \
+         "${MODEL_DIR}/rife" \
+         "${MODEL_DIR}/frame_interpolation" \
+         "${PERSISTENT_DIR}/ComfyUI/input" \
+         "${PERSISTENT_DIR}/ComfyUI/output"
+
+rm -rf /app/ComfyUI/models /app/ComfyUI/input /app/ComfyUI/output
+ln -sfn "${MODEL_DIR}" /app/ComfyUI/models
+ln -sfn "${PERSISTENT_DIR}/ComfyUI/input" /app/ComfyUI/input
+ln -sfn "${PERSISTENT_DIR}/ComfyUI/output" /app/ComfyUI/output
+
+rm -f /tmp/worker_stats_*.json /tmp/worker_stats.json
+
+# ==============================================================================
+# 4. Model Downloads (RIFE Heavy Weights)
+# ==============================================================================
+download_if_missing() {
+    local target_dir="$1"
+    local file_name="$2"
+    local url="$3"
+
+    mkdir -p "${target_dir}"
+
+    if [ -f "${target_dir}/${file_name}" ]; then
+        echo "[Storage] Found '${file_name}' on persistent storage. Skipping download."
+    else
+        echo "[Storage] Missing '${file_name}'. Downloading via aria2..."
+        
+        local ARIA_AUTH=()
+        if [ -n "$HF_TOKEN" ]; then
+            ARIA_AUTH=(--header="Authorization: Bearer ${HF_TOKEN}")
+        fi
+
+        if ! aria2c -x 8 -s 8 -k 1M \
+            --async-dns=false \
+            --max-tries=5 \
+            --retry-wait=2 \
+            "${ARIA_AUTH[@]}" \
+            -d "${target_dir}" -o "${file_name}" "${url}"; then
+            
+            echo "[Storage Warning] aria2c failed. Falling back to wget..."
+            
+            if [ -n "$HF_TOKEN" ]; then
+                wget --quiet --show-progress -c --header="Authorization: Bearer ${HF_TOKEN}" -O "${target_dir}/${file_name}" "${url}"
+            else
+                wget --quiet --show-progress -c -O "${target_dir}/${file_name}" "${url}"
+            fi
+        fi
+    fi
+}
+
+RIFE_DIR="${MODEL_DIR}/rife"
+FRAME_INTERP_DIR="${MODEL_DIR}/frame_interpolation"
+
+download_if_missing "${RIFE_DIR}" "rife_v4.26_heavy.safetensors" "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation/rife_v4.26_heavy.safetensors"
+
+# Symlink so nodes checking either directory succeed
+if [ -f "${RIFE_DIR}/rife_v4.26_heavy.safetensors" ] && [ ! -f "${FRAME_INTERP_DIR}/rife_v4.26_heavy.safetensors" ]; then
+    ln -sf "${RIFE_DIR}/rife_v4.26_heavy.safetensors" "${FRAME_INTERP_DIR}/rife_v4.26_heavy.safetensors"
+fi
+
+# ==============================================================================
+# 5. Launch N ComfyUI & N Node Daemons in Parallel
+# ==============================================================================
+pkill -f "main.py" || true
+rm -f /app/ComfyUI/user/comfyui.db.lock || true
+cd /app
+
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+BASE_PORT=8188
+COMFY_PIDS=()
+WORKER_PIDS=()
+
+echo "[Startup] Spawning ${TOTAL_INSTANCES} ComfyUI instances (ports ${BASE_PORT} to $((BASE_PORT + TOTAL_INSTANCES - 1)))..."
+
+for i in $(seq 1 "$TOTAL_INSTANCES"); do
+    PORT=$((BASE_PORT + i - 1))
+    /opt/venv/bin/python3 /app/ComfyUI/main.py \
+        --listen 0.0.0.0 --port "${PORT}" --gpu-only --fast --use-sage-attention --disable-auto-launch \
+        > "${LOG_DIR}/comfy_${i}.log" 2>&1 &
+    COMFY_PIDS+=($!)
+done
+
+echo "[Startup] Waiting for all ${TOTAL_INSTANCES} ComfyUI endpoints to respond..."
+for i in $(seq 1 "$TOTAL_INSTANCES"); do
+    PORT=$((BASE_PORT + i - 1))
+    until curl -s "http://127.0.0.1:${PORT}/history" > /dev/null 2>&1; do
+        sleep 1
+    done
+done
+echo "[Startup] All ${TOTAL_INSTANCES} ComfyUI runtimes online."
+
+echo "[Startup] Launching ${TOTAL_INSTANCES} Node.js workers..."
+for i in $(seq 1 "$TOTAL_INSTANCES"); do
+    PORT=$((BASE_PORT + i - 1))
+    COMFY_PORT="${PORT}" WORKER_SUFFIX="worker_${i}" node worker.js > "${LOG_DIR}/worker_${i}.log" 2>&1 &
+    WORKER_PIDS+=($!)
+done
+
+echo "[Startup] All ${TOTAL_INSTANCES} workers running. Tail logs with:"
+echo "  tail -fn +1 ${LOG_DIR}/worker_*.log"
+echo "  tail -f ${LOG_DIR}/entrypoint.log"
+
+# Await workers completion
+WORKER_EXIT_CODE=0
+for pid in "${WORKER_PIDS[@]}"; do
+    wait "$pid" || WORKER_EXIT_CODE=$?
+done
+
+# Teardown ComfyUI instances
+kill -9 "${COMFY_PIDS[@]}" 2>/dev/null || true
+
+# ==============================================================================
+# 6. Aggregate Stats & Finalize Session
+# ==============================================================================
+echo "[Billing] Finalizing worker session via /v1/worker/off..."
+
+STATS_DATA=$(node -e "
+    const fs = require('fs');
+    const path = require('path');
+    let jobs = 0;
+    let duration = 0;
+    try {
+        const files = fs.readdirSync('/tmp').filter(f => f.startsWith('worker_stats_') && f.endsWith('.json'));
+        if (fs.existsSync('/tmp/worker_stats.json')) files.push('worker_stats.json');
+        for (const f of files) {
+            try {
+                const data = JSON.parse(fs.readFileSync(path.join('/tmp', f), 'utf8'));
+                jobs += data.jobs_processed || 0;
+                duration += data.total_generation_time_sec || 0;
+            } catch (_) {}
         }
-        await sleep(POLL_INTERVAL_SECONDS * 1000);
-        continue;
-      }
+    } catch (_) {}
+    console.log(JSON.stringify({ jobs, duration: Math.round(duration) }));
+")
 
-      empty_poll_count = 0;
-      console.log(`${TAG} Got job ${current_job.job_id}`);
+JOBS_PROCESSED=$(echo "$STATS_DATA" | node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync(0,'utf-8')); console.log(d.jobs || 0);")
+TOTAL_GEN_TIME=$(echo "$STATS_DATA" | node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync(0,'utf-8')); console.log(d.duration || 0);")
 
-      // 1. Prefetch next input during active GPU inference
-      prefetch_promise = prefetch_next_job();
+OFF_PAYLOAD=$(cat <<EOF
+{
+  "session_id": "${WORKER_SESSION_ID}",
+  "machine_id": "${MACHINE_ID}",
+  "jobs_processed": ${JOBS_PROCESSED},
+  "total_generation_time_sec": ${TOTAL_GEN_TIME}
+}
+EOF
+)
 
-      try {
-        const { output_path: generated_file, duration } = await execute_workflow(current_job.workflow);
+curl -s -X POST "${API_BASE_URL}/v1/worker/off" \
+    -H "Content-Type: application/json" \
+    -H "worker-auth: ${WORKER_API_SECRET}" \
+    -H "x-machine-id: ${MACHINE_ID}" \
+    -d "${OFF_PAYLOAD}" || true
 
-        // 2. Clean up downloaded input immediately after ComfyUI completes execution
-        for (const p of current_job.downloaded_paths) {
-          try { await unlink(p); } catch (_) {}
-        }
+echo "[Billing] Session closed. Jobs: ${JOBS_PROCESSED}, Total Time: ${TOTAL_GEN_TIME}s."
 
-        const ext = generated_file.endsWith('.webm') ? 'webm' : 'mp4';
-        const isolated_path = join(OUTPUT_DIR, `uploading_${WORKER_SUFFIX}_${current_job.job_id}.${ext}`);
-        await rename(generated_file, isolated_path);
+# ==============================================================================
+# 7. Cloud Teardown & Auto-Shutdown
+# ==============================================================================
 
-        // 3. Delegate R2 upload to the background queue without holding unlinked input references
-        const upload_task = upload_and_complete_async(
-          current_job.job_id,
-          isolated_path,
-          duration
-        );
-        active_uploads.add(upload_task);
-        upload_task.finally(() => active_uploads.delete(upload_task));
+# --- Lium Pod Self-Termination ---
+if [ "$RUNNER_PLATFORM" = "lium" ] && [ -n "$LIUM_POD_ID" ]; then
+    echo "[Teardown] Calling Lium DELETE /api/pods/${LIUM_POD_ID}..."
+    LIUM_BASE_URL="${LIUM_BASE_URL:-https://lium.io/api}"
+    DELETE_RES=$(curl -s -X DELETE "${LIUM_BASE_URL}/pods/${LIUM_POD_ID}" \
+        -H "X-API-Key: ${LIUM_API_KEY}" \
+        -H "Accept: application/json" || true)
+    echo "[Teardown] Lium Response: ${DELETE_RES}"
 
-      } catch (render_err) {
-        console.error(`\x1b[31m${TAG} ✖ Job Execution Failed [${current_job.job_id}]: ${render_err.message}\x1b[0m`);
-        for (const p of current_job.downloaded_paths) {
-          try { await unlink(p); } catch (_) {}
-        }
-        await fail_job(current_job.job_id, render_err.message);
-      }
+# --- Hyperstack Hibernation ---
+elif [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
+    echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${HYPERSTACK_VM_NAME}..."
+    HYPERSTACK_API_URL="${HYPERSTACK_API_URL:-https://infrahub-api.nexgencloud.com/v1}"
+    
+    VM_ID=$(curl -s -H "api_key: ${HYPERSTACK_API_KEY}" -H "accept: application/json" \
+        "${HYPERSTACK_API_URL}/core/virtual-machines" | \
+        node -e "
+            const fs = require('fs');
+            try {
+                const data = JSON.parse(fs.readFileSync(0, 'utf-8'));
+                const match = (data.instances || []).find(v => v.name && v.name.toLowerCase() === '${HYPERSTACK_VM_NAME}'.toLowerCase());
+                if (match) process.stdout.write(String(match.id));
+            } catch (_) {}
+        ")
 
-      current_job = null;
-    } catch (loop_err) {
-      console.error(`\x1b[31m${TAG} Unexpected Loop Error: ${loop_err.message}\x1b[0m`);
-      await sleep(POLL_INTERVAL_SECONDS * 1000);
-    }
-  }
-};
+    if [ -n "$VM_ID" ]; then
+        echo "[Teardown] Hibernating VM ${VM_ID}..."
+        curl -s -H "api_key: ${HYPERSTACK_API_KEY}" \
+            "${HYPERSTACK_API_URL}/core/virtual-machines/${VM_ID}/hibernate?retain_ip=true" || true
+    fi
 
-worker_loop();
+# --- Vast.ai Stop Instance ---
+elif [ "$RUNNER_PLATFORM" = "vastai" ]; then
+    echo "[Teardown] Shutting down Vast.ai instance to prevent idle compute charges..."
+    
+    VAST_ID="${CONTAINER_ID:-${VAST_CONTAINERLABEL:-${MACHINE_ID}}}"
+
+    if [ -n "$CONTAINER_API_KEY" ] && [ -n "$VAST_ID" ]; then
+        echo "[Teardown] Calling Vast.ai REST API for instance ${VAST_ID}..."
+        curl -s -X PUT "https://console.vast.ai/api/v0/instances/${VAST_ID}/" \
+            -H "Authorization: Bearer ${CONTAINER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"state": "stopped"}' || true
+    elif command -v vastai >/dev/null 2>&1 && [ -n "$VAST_ID" ]; then
+        echo "[Teardown] Calling vastai CLI for instance ${VAST_ID}..."
+        vastai stop instance "$VAST_ID" || true
+    else
+        echo "[Teardown] Terminating PID 1..."
+        kill -s TERM 1 2>/dev/null || true
+    fi
+fi
+
+exit $WORKER_EXIT_CODE
