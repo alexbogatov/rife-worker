@@ -125,32 +125,26 @@ if [ "$NUM_GPUS" -lt 1 ]; then
 fi
 
 # ==============================================================================
-# Per-GPU Dynamic Scaling (Ignoring INSTANCES, math.floor(VRAM / 15GB) per GPU)
+# Per-GPU Dynamic Scaling (Strictly math.floor(VRAM / 15GB), ignoring INSTANCES)
 # ==============================================================================
-# We will evaluate VRAM for each individual GPU using python to handle math.floor precisely
-GPU_MAPPING_JSON=$(python3 -c '
-import subprocess, json, math
+CALC_METRICS=$(node -e '
+const cp = require("child_process");
+let vramList = [49152];
+try {
+    const smi = cp.execSync("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits", {encoding: "utf8"});
+    vramList = smi.trim().split("\n").map(x => parseInt(x.trim())).filter(x => !isNaN(x));
+} catch(e) {}
 
-try:
-    smi = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], universal_newlines=True)
-    vram_list = [int(x.strip()) for x in smi.strip().split("\n") if x.strip()]
-except Exception:
-    vram_list = [49152]
-
-mapping = []
-total_instances = 0
-for idx, vram_mib in enumerate(vram_list):
-    # 15 GB = 15360 MiB
-    workers = math.floor(vram_mib / 15360)
-    if workers < 1:
-        workers = 1
-    mapping.append({"gpu": idx, "vram": vram_mib, "workers": workers})
-    total_instances += workers
-
-print(json.dumps({"mapping": mapping, "total_instances": total_instances}))
+let totalInstances = 0;
+vramList.forEach(vram => {
+    let workers = Math.floor(vram / 15360);
+    if (workers < 1) workers = 1;
+    totalInstances += workers;
+});
+console.log(totalInstances);
 ')
 
-TOTAL_INSTANCES=$(echo "$GPU_MAPPING_JSON" | node -e "console.log(JSON.parse(fs.readFileSync(0, 'utf-8')).total_instances);")
+TOTAL_INSTANCES="${CALC_METRICS:-1}"
 
 MACHINE_ID=$(hostname)
 API_BASE_URL="${API_BASE_URL:-https://api.runltx.com}"
@@ -159,7 +153,7 @@ HYPERSTACK_VM_NAME="${VM_NAME:-${MACHINE_ID}}"
 echo "===================================================="
 echo "[Platform] Runtime  : $RUNNER_PLATFORM"
 echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($NUM_GPUS detected)"
-echo "[Hardware] Scaling  : Dynamically calculated per-GPU -> ${TOTAL_INSTANCES} total worker(s)"
+echo "[Hardware] Scaling  : Per-GPU math.floor(VRAM/15GB) -> ${TOTAL_INSTANCES} total worker(s)"
 echo "===================================================="
 
 # ==============================================================================
@@ -217,7 +211,7 @@ ln -sfn "${MODEL_DIR}" /app/ComfyUI/models
 ln -sfn "${PERSISTENT_DIR}/ComfyUI/input" /app/ComfyUI/input
 ln -sfn "${PERSISTENT_DIR}/ComfyUI/output" /app/ComfyUI/output
 
-rm -f /tmp/worker_stats_*.json /tmp/worker_stats.json
+rm -f /tmp/worker_stats_*.json /tmp/worker_stats.json /tmp/comfy_pid_* /tmp/node_worker_pids.txt
 
 # ==============================================================================
 # 4. Model Downloads (RIFE Heavy Weights)
@@ -260,7 +254,7 @@ if [ -f "${RIFE_DIR}/rife_v4.26_heavy.safetensors" ] && [ ! -f "${FRAME_INTERP_D
 fi
 
 # ==============================================================================
-# 5. Launch Parallel Workers Assigned to Specific GPUs
+# 5. Launch Parallel ComfyUI Instances & Workers per GPU
 # ==============================================================================
 pkill -f "main.py" || true
 rm -f /app/ComfyUI/user/comfyui.db.lock || true
@@ -269,50 +263,28 @@ cd /app
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 BASE_PORT=8188
-COMFY_PIDS=()
-WORKER_PIDS=()
 
-echo "[Startup] Distributing instances per GPU based on VRAM calculation..."
+echo "[Startup] Spawning ComfyUI instances mapped per GPU..."
 
-GLOBAL_INSTANCE_IDX=1
-# Read mapping using node to safely iterate over JSON array
-eval "$(python3 -c '
-import json, subprocess, math
-try:
-    smi = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], universal_newlines=True)
-    vram_list = [int(x.strip()) for x in smi.strip().split("\n") if x.strip()]
-except Exception:
-    vram_list = [49152]
-
-for idx, vram in enumerate(vram_list):
-    w = max(1, math.floor(vram / 15360))
-    print(f"echo \"[Startup] GPU {idx} has {vram} MiB VRAM -> Assigning {w} instance(s)\";")
-    for _ in range(w):
-        print(f"GPU_TARGET_{w}_{idx}=\"true\"") # placeholder for parsing loop
-')"
-
-# Simpler robust iteration using node for spawning
 node -e '
 const fs = require("fs");
 const cp = require("child_process");
-const math = require("mathjs") || { floor: Math.floor };
 
-let vram_list = [49152];
+let vramList = [49152];
 try {
     const smi = cp.execSync("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits", {encoding: "utf8"});
-    vram_list = smi.trim().split("\n").map(x => parseInt(x.trim())).filter(x => !isNaN(x));
+    vramList = smi.trim().split("\n").map(x => parseInt(x.trim())).filter(x => !isNaN(x));
 } catch(e) {}
 
 let globalIdx = 1;
 const basePort = 8188;
 const logDir = process.env.LOG_DIR || "/var/log/runner";
 
-vram_list.forEach((vram, gpuIdx) => {
+vramList.forEach((vram, gpuIdx) => {
     const workers = Math.max(1, Math.floor(vram / 15360));
-    console.log(`[Startup] GPU ${gpuIdx} (${vram} MiB VRAM): spawning ${workers} instance(s)`);
+    console.log(`[Startup] GPU ${gpuIdx} (${vram} MiB VRAM): assigning ${workers} instance(s)`);
     for (let w = 0; w < workers; w++) {
         const port = basePort + globalIdx - 1;
-        const suffix = `worker_${globalIdx}`;
         
         console.log(`[Startup] Spawning ComfyUI instance ${globalIdx} on GPU ${gpuIdx} (Port ${port})`);
         const comfyEnv = Object.assign({}, process.env, { CUDA_VISIBLE_DEVICES: String(gpuIdx) });
@@ -330,13 +302,12 @@ vram_list.forEach((vram, gpuIdx) => {
             stdio: ["ignore", comfyLog, comfyLog]
         });
         fs.writeFileSync(`/tmp/comfy_pid_${globalIdx}`, String(comfyChild.pid));
-
         globalIdx++;
     }
 });
 '
 
-echo "[Startup] Waiting for all ComfyUI endpoints to respond..."
+echo "[Startup] Waiting for all ${TOTAL_INSTANCES} ComfyUI endpoint(s) to respond..."
 for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
     until curl -s "http://127.0.0.1:${PORT}/history" > /dev/null 2>&1; do
@@ -346,11 +317,11 @@ done
 echo "[Startup] All ComfyUI endpoints are healthy."
 
 echo "[Startup] Launching ${TOTAL_INSTANCES} Node.js workers..."
+WORKER_PIDS=()
 for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
     WORKER_SESSION_ID="${WORKER_SESSION_ID}" COMFY_PORT="${PORT}" WORKER_SUFFIX="worker_${i}" node worker.js > >(tee -a "${LOG_DIR}/worker_${i}.log") 2>&1 &
     WORKER_PIDS+=($!)
-    # Keep track for final kill
     echo $! >> /tmp/node_worker_pids.txt
 done
 
