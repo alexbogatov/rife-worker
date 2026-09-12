@@ -264,7 +264,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 BASE_PORT=8188
 
-echo "[Startup] Spawning ComfyUI instances mapped per GPU..."
+echo "[Startup] Initiating spawn sequence for ${TOTAL_INSTANCES} ComfyUI instance(s)..."
 
 node -e '
 const fs = require("fs");
@@ -282,11 +282,11 @@ const logDir = process.env.LOG_DIR || "/var/log/runner";
 
 vramList.forEach((vram, gpuIdx) => {
     const workers = Math.max(1, Math.floor(vram / 15360));
-    console.log(`[Startup] GPU ${gpuIdx} (${vram} MiB VRAM): assigning ${workers} instance(s)`);
+    console.log(`[ComfyUI] GPU ${gpuIdx} (${vram} MiB VRAM): allocating ${workers} instance(s)`);
     for (let w = 0; w < workers; w++) {
         const port = basePort + globalIdx - 1;
         
-        console.log(`[Startup] Spawning ComfyUI instance ${globalIdx} on GPU ${gpuIdx} (Port ${port})`);
+        console.log(`[ComfyUI] Starting instance ${globalIdx} on GPU ${gpuIdx} (Port ${port}) -> Logging to ${logDir}/comfy_${globalIdx}.log`);
         const comfyEnv = Object.assign({}, process.env, { CUDA_VISIBLE_DEVICES: String(gpuIdx) });
         const comfyLog = fs.openSync(`${logDir}/comfy_${globalIdx}.log`, "a");
         const comfyChild = cp.spawn("/opt/venv/bin/python3", [
@@ -307,19 +307,22 @@ vramList.forEach((vram, gpuIdx) => {
 });
 '
 
-echo "[Startup] Waiting for all ${TOTAL_INSTANCES} ComfyUI endpoint(s) to respond..."
+echo "[Startup] Waiting for all ${TOTAL_INSTANCES} ComfyUI endpoint(s) to respond to health checks..."
 for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
+    echo "[HealthCheck] Polling ComfyUI instance ${i} on port ${PORT}..."
     until curl -s "http://127.0.0.1:${PORT}/history" > /dev/null 2>&1; do
         sleep 1
     done
+    echo "[HealthCheck] ComfyUI instance ${i} (Port ${PORT}) is UP and responding."
 done
-echo "[Startup] All ComfyUI endpoints are healthy."
+echo "[Startup] All ComfyUI endpoints are verified healthy."
 
-echo "[Startup] Launching ${TOTAL_INSTANCES} Node.js workers..."
+echo "[Startup] Launching ${TOTAL_INSTANCES} Node.js worker(s)..."
 WORKER_PIDS=()
 for i in $(seq 1 "$TOTAL_INSTANCES"); do
     PORT=$((BASE_PORT + i - 1))
+    echo "[Worker] Starting worker_${i} bound to port ${PORT} -> Logging to ${LOG_DIR}/worker_${i}.log"
     WORKER_SESSION_ID="${WORKER_SESSION_ID}" COMFY_PORT="${PORT}" WORKER_SUFFIX="worker_${i}" node worker.js > >(tee -a "${LOG_DIR}/worker_${i}.log") 2>&1 &
     WORKER_PIDS+=($!)
     echo $! >> /tmp/node_worker_pids.txt
